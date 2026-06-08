@@ -1482,6 +1482,13 @@ header {
       </div>
 
       <div class="form-group">
+        <label class="form-label" for="output-dir-input">Output Directory <span style="color:var(--dim);font-weight:400">(optional)</span></label>
+        <input class="form-input" type="text" id="output-dir-input"
+               placeholder="Default: farm_data/output/&lt;job-name&gt;">
+        <div style="font-size:.68rem;color:var(--dim);margin-top:3px">Absolute path or leave blank to use default location</div>
+      </div>
+
+      <div class="form-group">
         <label class="form-checkbox-wrap">
           <input type="checkbox" id="skip-existing-check" checked>
           <span class="form-checkbox-label">Skip already rendered frames</span>
@@ -1810,13 +1817,24 @@ function renderJobs(s) {
     return;
   }
 
+  // Save expanded detail content — prevents "Loading..." flash during every re-render
+  const savedDetails = {};
+  STATE.expandedJobs.forEach(jid => {
+    const el = document.getElementById('job-detail-content-' + jid);
+    if (el) savedDetails[jid] = el.innerHTML;
+  });
+
   list.innerHTML = jobs.map(j => renderJobCard(j)).join('');
 
-  // Re-attach detail polling for expanded jobs
+  // Re-attach expanded state, restoring saved content while fresh data loads
   STATE.expandedJobs.forEach(jid => {
     const detailEl = document.getElementById('job-detail-' + jid);
     if (detailEl) {
       detailEl.classList.add('open');
+      const contentEl = document.getElementById('job-detail-content-' + jid);
+      if (contentEl && savedDetails[jid]) {
+        contentEl.innerHTML = savedDetails[jid];  // show last-known content instantly
+      }
       fetchJobDetail(jid);
     }
   });
@@ -1905,7 +1923,11 @@ function renderJobDetail(jobId) {
   const rendPct = (rendCount / total * 100).toFixed(1);
   const failPct = (failCount / total * 100).toFixed(1);
 
+  const outputDir = summary.output_dir || '';
   container.innerHTML = `
+    ${outputDir ? `<div style="font-size:.68rem;color:var(--dim);padding:6px 8px;background:var(--panel2);border-radius:var(--radius-sm);margin-bottom:8px;word-break:break-all">
+      <span style="color:var(--accent2)">📁 Output:</span> ${esc(outputDir)}
+    </div>` : ''}
     <div class="detail-section-title">Frame Grid</div>
     <div class="frame-grid-wrap">
       <div class="frame-grid" id="frame-grid-${esc(jobId)}">
@@ -2133,6 +2155,7 @@ function openSubmitModal() {
   document.getElementById('device-select').value = '';
   document.getElementById('samples-input').value = '';
   document.getElementById('format-select').value = '';
+  document.getElementById('output-dir-input').value = '';
   document.getElementById('skip-existing-check').checked = true;
   document.getElementById('detected-info').classList.remove('visible');
   document.getElementById('upload-progress').classList.remove('active');
@@ -2264,6 +2287,9 @@ async function submitJob() {
     const format = document.getElementById('format-select').value;
     if (format) fd.append('format', format);
 
+    const outputDir = document.getElementById('output-dir-input').value.trim();
+    if (outputDir) fd.append('output_dir', outputDir);
+
     fd.append('skip_existing', document.getElementById('skip-existing-check').checked ? '1' : '0');
 
     // Show upload progress for file uploads
@@ -2321,14 +2347,17 @@ function startPolling() {
   STATE.pollTimer = setInterval(fetchStatus, 2000);
 }
 
-// SSE push: trigger immediate re-fetch on state changes (supplements polling)
+// SSE push: trigger re-fetch on state changes (supplements polling)
+// Debounced so rapid frame_done events don't hammer the UI
 function connectDashboardSSE() {
+  let _debounce = null;
   const es = new EventSource(API_BASE + '/api/events');
   es.onmessage = (e) => {
     try {
       const event = JSON.parse(e.data);
       if (['frame_done', 'job_submitted', 'job_cancelled'].includes(event.type)) {
-        fetchStatus();
+        clearTimeout(_debounce);
+        _debounce = setTimeout(() => fetchStatus(), 800);
       }
     } catch {}
   };

@@ -309,6 +309,7 @@ def job_summary(job):
         "farm_fps": round(fps, 4) if fps else None,
         "created_at": job["created_at"],
         "shared_path": job.get("shared_path"),
+        "output_dir": job.get("output_dir"),
     }
 
 
@@ -538,6 +539,7 @@ def api_submit_job():
     out_format = (form.get("format") or "").strip()
     skip_existing = form.get("skip_existing") in ("1", "true", "on")
     shared_path = (form.get("shared_path") or "").strip()
+    output_dir_override = (form.get("output_dir") or "").strip()
 
     blend_filename = None
     blend_path = None
@@ -585,7 +587,10 @@ def api_submit_job():
     if frame_end == 0:
         frame_end = frame_start
 
-    job_out = OUTPUT_DIR / name
+    if output_dir_override:
+        job_out = Path(output_dir_override)
+    else:
+        job_out = OUTPUT_DIR / name
     job_out.mkdir(parents=True, exist_ok=True)
     ext = EXT_FOR_FORMAT.get(out_format, "png")
 
