@@ -822,6 +822,31 @@ header {
 .frame-cell.assigned { background: var(--warn); opacity: .7; }
 .frame-cell.cancelled-cell { background: var(--idle); opacity: .5; }
 
+/* Recent-frames thumbnail strip */
+.recent-frames-strip {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 10px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); min-height: 70px; align-items: flex-start;
+}
+.recent-frame-thumb {
+  position: relative; cursor: pointer;
+  border-radius: 4px; overflow: hidden;
+  border: 1px solid var(--line);
+  transition: transform .15s, border-color .15s;
+  text-decoration: none;
+}
+.recent-frame-thumb:hover { transform: scale(1.05); border-color: var(--accent); }
+.recent-frame-thumb img {
+  display: block; width: 80px; height: 60px;
+  object-fit: cover; background: var(--panel2);
+}
+.recent-frame-thumb .thumb-label {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,.7); color: var(--txt);
+  font-size: .55rem; text-align: center; padding: 2px 0;
+}
+
 /* Tooltip */
 .tooltip {
   position: fixed;
@@ -1669,7 +1694,7 @@ function renderAll() {
 
 /* --- Header Stats --- */
 function renderHeaderStats(s) {
-  const totalGPUs = s.workers ? s.workers.length : 0;
+  const totalGPUs = s.workers ? s.workers.filter(w => w.status !== 'offline').length : 0;
   const renderingCount = s.workers ? s.workers.filter(w => w.status === 'rendering').length : 0;
   const totalFramesDone = s.jobs ? s.jobs.reduce((sum, j) => sum + (j.done || 0), 0) : 0;
 
@@ -1684,7 +1709,7 @@ function renderPeers(s) {
   const container = document.getElementById('peers-container');
   const peers = s.peers || [];
   const allPeers = [
-    { node_id: s.node_id, name: s.node_name || s.node_id, ip: 'localhost', port: location.port || 80, isSelf: true, last_seen_ago: 0, jobs_active: (s.jobs || []).filter(j=>j.status==='rendering').length, workers_active: (s.workers || []).filter(w=>w.status==='rendering').length },
+    { node_id: s.node_id, name: s.node_name || s.node_id, ip: 'localhost', port: location.port || 80, isSelf: true, last_seen_ago: 0, jobs_active: (s.jobs || []).filter(j=>j.status==='rendering').length, workers_active: (s.workers || []).filter(w=>w.status!=='offline').length },
     ...peers
   ];
 
@@ -1835,7 +1860,8 @@ function renderJobCard(j) {
         <span><span class="val done-val">${j.done || 0}</span>/${total} done</span>
         <span><span class="val rend-val">${j.rendering || 0}</span> rendering</span>
         <span><span class="val fail-val">${j.failed || 0}</span> failed</span>
-        <span>ETA <span class="val eta-val">${fmtETA(j.eta_seconds)}</span></span>
+        <span>ETA <span class="val eta-val">${fmtETA(j.eta_seconds)}</span>${j.eta_confidence != null ? ` <span style="color:var(--dim);font-size:.7rem">(${j.eta_confidence}%)</span>` : ''}</span>
+        ${j.farm_fps ? `<span style="color:var(--dim);font-size:.75rem">${(j.farm_fps*60).toFixed(2)} fpm</span>` : ''}
         ${j.avg_render_time ? `<span>avg <span class="val">${fmtTime(j.avg_render_time)}</span>/frame</span>` : ''}
       </div>
 
@@ -1907,6 +1933,22 @@ function renderJobDetail(jobId) {
       <div class="timeline-label">${doneCount}/${total} complete (${donePct}%)</div>
     </div>
 
+    <div class="detail-section-title">Recent Frames</div>
+    <div class="recent-frames-strip">
+      ${(() => {
+        const done = frames.filter(f => f.status === 'done').sort((a,b) => b.frame - a.frame).slice(0, 8);
+        if (!done.length) return '<span style="color:var(--dim);font-size:.75rem;padding:4px">No completed frames yet</span>';
+        return done.map(f =>
+          `<a class="recent-frame-thumb" href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image" download>
+            <img src="/api/jobs/${esc(jobId)}/frames/${f.frame}/image"
+                 alt="Frame ${f.frame}"
+                 onerror="this.parentElement.style.display='none'"
+                 loading="lazy">
+            <div class="thumb-label">#${f.frame}</div>
+          </a>`).join('');
+      })()}
+    </div>
+
     <div class="detail-section-title">Frame Table</div>
     <div class="frame-filter-row">
       <input class="frame-filter-input" type="text" placeholder="Search frame # or worker..."
@@ -1964,7 +2006,9 @@ function renderFrameTable(jobId, frames) {
     </tr></thead>
     <tbody>
     ${filtered.slice(0, 200).map(f => `<tr>
-      <td style="font-weight:600">${f.frame}</td>
+      <td style="font-weight:600">${f.status === 'done'
+        ? `<a href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image" download style="color:var(--accent);text-decoration:none">${f.frame} ⬇</a>`
+        : f.frame}</td>
       <td><span class="status-badge ${statusClass(f.status)} small" style="font-size:.6rem;padding:2px 6px"><span class="status-dot"></span>${esc(f.status)}</span></td>
       <td>${esc(f.worker || '—')}</td>
       <td>${fmtTime(f.render_time)}</td>
@@ -2276,6 +2320,21 @@ function startPolling() {
   fetchStatus();
   STATE.pollTimer = setInterval(fetchStatus, 2000);
 }
+
+// SSE push: trigger immediate re-fetch on state changes (supplements polling)
+function connectDashboardSSE() {
+  const es = new EventSource(API_BASE + '/api/events');
+  es.onmessage = (e) => {
+    try {
+      const event = JSON.parse(e.data);
+      if (['frame_done', 'job_submitted', 'job_cancelled'].includes(event.type)) {
+        fetchStatus();
+      }
+    } catch {}
+  };
+  es.onerror = () => { es.close(); setTimeout(connectDashboardSSE, 5000); };
+}
+connectDashboardSSE();
 
 // Start immediately
 startPolling();

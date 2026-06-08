@@ -17,9 +17,11 @@ import json
 import time
 import uuid
 import glob
+import queue as _queue
 import socket
 import shutil
 import platform
+import statistics
 import threading
 import argparse
 import subprocess
@@ -41,6 +43,8 @@ STATE_FILE   = DATA_DIR / "state.json"
 WORKER_TIMEOUT     = 120
 FRAME_TIMEOUT      = 1800
 MAX_FRAME_ATTEMPTS = 3
+PREFETCH_THRESHOLD = 75   # % progress that triggers prefetch
+PREFETCH_DEADLINE  = 90   # seconds before stale prefetch is reclaimed
 
 for d in (DATA_DIR, BLEND_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -51,6 +55,8 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024  # 8 GB
 LOCK = threading.Lock()
 JOBS = {}
 WORKERS = {}
+WORKER_SSE_QUEUES:     dict = {}  # wid -> queue.Queue (connected idle workers)
+DASHBOARD_SSE_CLIENTS: list = []  # list of queue.Queue (connected dashboard tabs)
 
 # Set by renderhive.py before app starts
 DISCOVERY = None      # PeerDiscovery instance
@@ -150,6 +156,7 @@ def load_state():
                     if fr["status"] == "assigned":
                         fr["status"] = "pending"
                         fr["worker"] = None
+                        fr.pop("prefetch_deadline", None)
                 if job["status"] == "rendering":
                     job["status"] = "queued"
         except Exception as e:
@@ -165,6 +172,100 @@ EXT_FOR_FORMAT = {
 }
 
 
+def _worker_avg_speed(w):
+    """Mean of last 10 render times, or None if no history."""
+    times = w.get("render_times", [])[-10:]
+    return sum(times) / len(times) if times else None
+
+
+def _prefetch_count(w):
+    """Number of frames to pre-assign: 1–3 based on worker speed tier."""
+    avg = _worker_avg_speed(w)
+    if not avg or avg <= 0:
+        return 1
+    return max(1, min(3, int(PREFETCH_DEADLINE / avg)))
+
+
+def _push_worker_event(wid, event):
+    """Push an SSE event to a connected worker (safe to call inside LOCK)."""
+    q = WORKER_SSE_QUEUES.get(wid)
+    if q:
+        try:
+            q.put_nowait(event)
+        except _queue.Full:
+            pass
+
+
+def _broadcast_dashboard(event):
+    """Push an SSE event to all connected dashboard tabs (safe inside LOCK)."""
+    for q in list(DASHBOARD_SSE_CLIENTS):
+        try:
+            q.put_nowait(event)
+        except _queue.Full:
+            pass
+
+
+def _farm_fps():
+    """Combined frames/sec of all rendering workers (call inside LOCK)."""
+    fps = 0.0
+    for w in WORKERS.values():
+        if w["status"] == "rendering":
+            avg = _worker_avg_speed(w)
+            if avg and avg > 0:
+                fps += 1.0 / avg
+    return fps if fps > 0 else None
+
+
+def _try_prefetch_frames(wid):
+    """Pre-assign 0–N pending frames based on worker speed. Must be called inside LOCK."""
+    w = WORKERS.get(wid)
+    if not w:
+        return []
+    already = sum(
+        1 for j in JOBS.values() for f in j["frames"].values()
+        if f.get("worker") == wid and f.get("prefetch_deadline") and f["status"] == "assigned"
+    )
+    n_want = _prefetch_count(w) - already
+    if n_want <= 0:
+        return []
+    remaining_pending = sum(
+        1 for j in JOBS.values()
+        if j["status"] not in ("cancelled", "done")
+        for f in j["frames"].values() if f["status"] == "pending"
+    )
+    active_workers = sum(1 for w2 in WORKERS.values() if w2["status"] == "rendering")
+    if remaining_pending <= active_workers:
+        return []
+    assignments = []
+    now = time.time()
+    for job in sorted(JOBS.values(), key=lambda x: x["created_at"]):
+        if job["status"] in ("cancelled", "done"):
+            continue
+        for k, fr in sorted(job["frames"].items(), key=lambda kv: int(kv[0])):
+            if fr["status"] != "pending":
+                continue
+            fr.update({
+                "status": "assigned", "worker": wid,
+                "started_at": now, "progress": 0,
+                "attempts": fr.get("attempts", 0) + 1,
+                "prefetch_deadline": now + PREFETCH_DEADLINE,
+            })
+            assignments.append({
+                "job_id": job["id"], "frame": int(k),
+                "blend_filename": job["blend_filename"],
+                "shared_path": job.get("shared_path"),
+                "blend_url": f"/api/jobs/{job['id']}/blend",
+                "engine": job["engine"], "device": job["device"],
+                "samples": job["samples"], "format": job["format"],
+            })
+            n_want -= 1
+            if n_want <= 0:
+                break
+        if n_want <= 0:
+            break
+    return assignments
+
+
 def job_summary(job):
     frames = job["frames"]
     total = len(frames)
@@ -174,10 +275,25 @@ def job_summary(job):
     times = [f["render_time"] for f in frames.values()
              if f["status"] == "done" and f.get("render_time")]
     avg = sum(times) / len(times) if times else None
-    active_workers = max(1, sum(1 for w in WORKERS.values()
-                                if w["status"] == "rendering"))
     remaining = total - done - failed
-    eta = (avg * remaining / active_workers) if (avg and remaining) else None
+    # Farm-fps ETA: more accurate than naive per-worker average
+    fps = _farm_fps()
+    if fps and fps > 0 and remaining > 0:
+        eta = remaining / fps
+    elif avg and remaining:
+        active = max(1, sum(1 for w in WORKERS.values() if w["status"] == "rendering"))
+        eta = avg * remaining / active
+    else:
+        eta = None
+    # ETA confidence based on coefficient of variation of recent render times
+    all_times = [t for w in WORKERS.values() for t in w.get("render_times", [])[-10:]]
+    if len(all_times) >= 3:
+        mean_t = statistics.mean(all_times)
+        stdev_t = statistics.stdev(all_times)
+        cv = stdev_t / mean_t if mean_t > 0 else 1.0
+        confidence = max(0, min(99, int(100 * (1 - cv))))
+    else:
+        confidence = None
     return {
         "id": job["id"], "name": job["name"], "status": job["status"],
         "blend_filename": job["blend_filename"],
@@ -189,6 +305,8 @@ def job_summary(job):
         "total": total, "done": done, "failed": failed, "rendering": rendering,
         "avg_render_time": round(avg, 1) if avg else None,
         "eta_seconds": round(eta) if eta else None,
+        "eta_confidence": confidence,
+        "farm_fps": round(fps, 4) if fps else None,
         "created_at": job["created_at"],
         "shared_path": job.get("shared_path"),
     }
@@ -213,15 +331,53 @@ def reap_dead_workers_and_frames():
                         continue
                     worker = WORKERS.get(fr["worker"])
                     stale_worker = (worker is None or worker["status"] == "offline")
-                    stale_frame = now - fr.get("started_at", now) > FRAME_TIMEOUT
+                    # Prefetch frames use a short deadline; normal frames use FRAME_TIMEOUT
+                    deadline = fr.get("prefetch_deadline")
+                    if deadline is not None:
+                        stale_frame = now > deadline
+                        if stale_frame and fr.get("progress", 0) == 0:
+                            fr["attempts"] = max(0, fr.get("attempts", 1) - 1)
+                        fr.pop("prefetch_deadline", None)
+                    else:
+                        stale_frame = now - fr.get("started_at", now) > FRAME_TIMEOUT
                     if stale_worker or stale_frame:
-                        fr["attempts"] = fr.get("attempts", 0)
-                        if fr["attempts"] >= MAX_FRAME_ATTEMPTS:
+                        if fr.get("attempts", 0) >= MAX_FRAME_ATTEMPTS:
                             fr["status"] = "failed"
                         else:
                             fr["status"] = "pending"
                         fr["worker"] = None
                         fr["progress"] = 0
+            # Work stealing: reclaim low-progress frames from abnormally slow workers
+            # Only when at least one idle worker is waiting for work
+            idle_workers = [w for w in WORKERS.values()
+                            if w["status"] == "idle" and now - w["last_seen"] < WORKER_TIMEOUT]
+            if idle_workers:
+                all_times = [t for w in WORKERS.values()
+                             for t in w.get("render_times", [])[-10:] if w.get("render_times")]
+                if all_times:
+                    farm_avg = statistics.mean(all_times)
+                    steal_after = max(farm_avg * 3, 180)
+                    for job in JOBS.values():
+                        if job["status"] not in ("rendering", "queued"):
+                            continue
+                        for fno, fr in job["frames"].items():
+                            if fr["status"] != "assigned" or fr.get("progress", 0) >= 5:
+                                continue
+                            if now - fr.get("started_at", now) < steal_after:
+                                continue
+                            assigned_w = WORKERS.get(fr.get("worker"))
+                            if not assigned_w:
+                                continue
+                            w_avg = _worker_avg_speed(assigned_w)
+                            if w_avg and w_avg > farm_avg * 1.5:
+                                fr["status"] = "pending"
+                                fr["worker"] = None
+                                fr["progress"] = 0
+                                fr.pop("prefetch_deadline", None)
+                                print(f"  [STEAL] frame {fno} reclaimed "
+                                      f"(worker avg {round(w_avg)}s vs farm avg {round(farm_avg)}s)")
+                                for iw in idle_workers:
+                                    _push_worker_event(iw["id"], {"type": "work_available"})
             _recompute_job_statuses()
         save_state()
 
@@ -255,6 +411,7 @@ def api_status():
     now = time.time()
     with LOCK:
         workers = []
+        hostname_stats = {}  # hostname -> {workers_online, jobs_active}
         for w in sorted(WORKERS.values(), key=lambda x: x["name"]):
             offline = now - w["last_seen"] > WORKER_TIMEOUT
             # compute avg render time for this worker
@@ -280,6 +437,14 @@ def api_status():
                 "avg_render_time": avg_rt,
                 "total_render_time": total_rt,
             })
+            # Accumulate per-hostname stats for peer card enrichment
+            h = w.get("hostname", "?")
+            if h not in hostname_stats:
+                hostname_stats[h] = {"workers_online": 0, "jobs_active": set()}
+            if not offline:
+                hostname_stats[h]["workers_online"] += 1
+            if w.get("current_job") and not offline:
+                hostname_stats[h]["jobs_active"].add(w["current_job"])
         jobs = [job_summary(j) for j in
                 sorted(JOBS.values(), key=lambda x: x["created_at"], reverse=True)]
 
@@ -287,12 +452,15 @@ def api_status():
     peers = []
     if DISCOVERY:
         for p in DISCOVERY.get_peers():
+            pstats = hostname_stats.get(p["name"], {})
             peers.append({
                 "node_id": p["node_id"],
                 "ip": p["ip"],
                 "port": p["port"],
                 "name": p["name"],
                 "last_seen_ago": round(now - p["last_seen"]),
+                "workers_active": pstats.get("workers_online", 0),
+                "jobs_active": len(pstats.get("jobs_active", set())),
             })
 
     node_id = DISCOVERY.node_id if DISCOVERY else "local"
@@ -446,9 +614,12 @@ def api_submit_job():
     with LOCK:
         JOBS[job_id] = job
         _recompute_job_statuses()
+        for _wid in list(WORKER_SSE_QUEUES.keys()):
+            _push_worker_event(_wid, {"type": "work_available"})
+        _broadcast_dashboard({"type": "job_submitted", "job_id": job_id})
     save_state()
 
-    # Wake all workers so they immediately poll
+    # Wake all workers so they immediately poll (for non-SSE workers too)
     if DISCOVERY:
         DISCOVERY.broadcast_wake()
 
@@ -496,11 +667,20 @@ def api_cancel(job_id):
         if not job:
             abort(404)
         job["status"] = "cancelled"
+        affected_workers = set()
         for fr in job["frames"].values():
             if fr["status"] in ("pending", "assigned"):
+                if fr.get("worker"):
+                    affected_workers.add(fr["worker"])
                 fr["status"] = "cancelled"
                 fr["worker"] = None
+        for awid in affected_workers:
+            _push_worker_event(awid, {"type": "cancel", "job_id": job_id})
+        _broadcast_dashboard({"type": "job_cancelled", "job_id": job_id})
     save_state()
+    # Also wake workers via UDP so those without SSE detect the cancel
+    if DISCOVERY:
+        DISCOVERY.broadcast_wake()
     return jsonify({"ok": True})
 
 
@@ -674,6 +854,8 @@ def api_next_frame(wid):
 @app.route("/api/workers/<wid>/progress", methods=["POST"])
 def api_progress(wid):
     d = request.get_json(force=True, silent=True) or {}
+    cancel = False
+    prefetch = None
     with LOCK:
         w = WORKERS.get(wid)
         if w:
@@ -681,10 +863,21 @@ def api_progress(wid):
             w["progress"] = d.get("progress", 0)
         job = JOBS.get(d.get("job_id"))
         if job:
-            fr = job["frames"].get(str(d.get("frame")))
-            if fr and fr["status"] == "assigned":
-                fr["progress"] = d.get("progress", 0)
-    return jsonify({"ok": True})
+            if job["status"] == "cancelled":
+                cancel = True
+            else:
+                fr = job["frames"].get(str(d.get("frame")))
+                if fr:
+                    if fr["status"] == "cancelled":
+                        cancel = True
+                    elif fr["status"] == "assigned":
+                        progress = d.get("progress", 0)
+                        fr["progress"] = progress
+                        if not cancel and progress >= PREFETCH_THRESHOLD:
+                            assignments = _try_prefetch_frames(wid)
+                            if assignments:
+                                prefetch = assignments
+    return jsonify({"ok": True, "cancel": cancel, "prefetch": prefetch})
 
 
 @app.route("/api/workers/<wid>/complete", methods=["POST"])
@@ -698,34 +891,47 @@ def api_complete(wid):
     if not job:
         return jsonify({"error": "unknown job"}), 404
 
-    out_dir = Path(job["output_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / f"{job['name']}_{frame:04d}.{job['ext']}"
-    if "image" in request.files:
-        request.files["image"].save(str(out_file))
+    # Pre-check cancel status before doing any disk I/O
+    with LOCK:
+        fr_check = job["frames"].get(str(frame))
+        is_cancelled = fr_check is not None and fr_check["status"] == "cancelled"
+
+    if not is_cancelled:
+        out_dir = Path(job["output_dir"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_file = out_dir / f"{job['name']}_{frame:04d}.{job['ext']}"
+        if "image" in request.files:
+            request.files["image"].save(str(out_file))
 
     with LOCK:
         fr = job["frames"].get(str(frame))
-        if fr:
+        if fr and not is_cancelled:
             fr["status"] = "done"
             fr["render_time"] = render_time
             fr["worker"] = wid
             fr["progress"] = 100
             fr["finished_at"] = time.time()
+            fr.pop("prefetch_deadline", None)
         if w:
-            w["frames_done"] += 1
             w["status"] = "idle"
             w["current_job"] = None
             w["current_frame"] = None
             w["progress"] = 0
             w["last_seen"] = time.time()
-            if "render_times" not in w:
-                w["render_times"] = []
-            w["render_times"].append(render_time)
-            # keep last 100 times for avg
-            if len(w["render_times"]) > 100:
-                w["render_times"] = w["render_times"][-100:]
-        _recompute_job_statuses()
+            if not is_cancelled:
+                w["frames_done"] = w.get("frames_done", 0) + 1
+                if "render_times" not in w:
+                    w["render_times"] = []
+                w["render_times"].append(render_time)
+                # keep last 100 times for avg
+                if len(w["render_times"]) > 100:
+                    w["render_times"] = w["render_times"][-100:]
+        if not is_cancelled:
+            _recompute_job_statuses()
+        # Push SSE events regardless of cancel status
+        _push_worker_event(wid, {"type": "work_available"})
+        if not is_cancelled:
+            _broadcast_dashboard({"type": "frame_done", "job_id": job_id, "frame": frame})
     save_state()
     return jsonify({"ok": True})
 
@@ -749,6 +955,7 @@ def api_fail(wid):
                     fr["status"] = "pending"
                 fr["worker"] = None
                 fr["progress"] = 0
+                fr.pop("prefetch_deadline", None)
         if w:
             w["status"] = "idle"
             w["current_job"] = None
@@ -758,6 +965,74 @@ def api_fail(wid):
     save_state()
     print(f"[FAIL] worker={wid} job={job_id} frame={frame}\n{log[-500:]}")
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# SSE endpoints
+# ---------------------------------------------------------------------------
+@app.route("/api/workers/<wid>/stream")
+def api_worker_stream(wid):
+    """SSE stream for pushing work_available / cancel events to a specific worker."""
+    q = _queue.Queue(maxsize=10)
+    with LOCK:
+        WORKER_SSE_QUEUES[wid] = q
+
+    def generate():
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=25)
+                    if event is None:
+                        return
+                    yield f"data: {json.dumps(event)}\n\n"
+                except _queue.Empty:
+                    yield ": heartbeat\n\n"
+        finally:
+            with LOCK:
+                if WORKER_SSE_QUEUES.get(wid) is q:
+                    WORKER_SSE_QUEUES.pop(wid, None)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/events")
+def api_dashboard_events():
+    """SSE stream for pushing real-time state change events to dashboard tabs."""
+    q = _queue.Queue(maxsize=20)
+    DASHBOARD_SSE_CLIENTS.append(q)
+
+    def generate():
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=25)
+                    if event is None:
+                        return
+                    yield f"data: {json.dumps(event)}\n\n"
+                except _queue.Empty:
+                    yield ": heartbeat\n\n"
+        finally:
+            try:
+                DASHBOARD_SSE_CLIENTS.remove(q)
+            except ValueError:
+                pass
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/jobs/<job_id>/frames/<int:frame_num>/image")
+def api_frame_image(job_id, frame_num):
+    """Serve a single completed frame image directly (no ZIP required)."""
+    with LOCK:
+        job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+    out_file = Path(job["output_dir"]) / f"{job['name']}_{frame_num:04d}.{job['ext']}"
+    if not out_file.exists():
+        abort(404)
+    return send_file(str(out_file))
 
 
 # ---------------------------------------------------------------------------

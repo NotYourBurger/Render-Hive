@@ -14,6 +14,7 @@ import sys
 import time
 import json
 import glob
+import queue as _queue
 import random
 import socket
 import platform
@@ -162,6 +163,8 @@ class Worker:
         self.bversion = blender_version(blender)
         self._registered_with = set()  # coordinator URLs we've registered with
         self._wake_event = threading.Event()
+        self._prefetch_queue: list = []         # list of (coord_url, assignment) tuples
+        self._sse_event_queue = _queue.Queue()  # events pushed from coordinator SSE stream
 
     def _worker_info(self):
         """Worker info dict sent with registration and /next requests."""
@@ -225,11 +228,12 @@ class Worker:
 
     def report_progress(self, coord_url, job_id, frame, progress):
         try:
-            requests.post(f"{coord_url}/api/workers/{self.id}/progress",
-                          json={"job_id": job_id, "frame": frame,
-                                "progress": progress}, timeout=10)
+            r = requests.post(f"{coord_url}/api/workers/{self.id}/progress",
+                              json={"job_id": job_id, "frame": frame,
+                                    "progress": progress}, timeout=10)
+            return r.json()
         except requests.RequestException:
-            pass
+            return None
 
     def report_fail(self, coord_url, job_id, frame, log):
         try:
@@ -238,6 +242,23 @@ class Worker:
                           timeout=20)
         except requests.RequestException:
             pass
+
+    def _listen_sse(self, coord_url):
+        """Background daemon: maintain SSE stream and feed events to _sse_event_queue."""
+        try:
+            with requests.get(f"{coord_url}/api/workers/{self.id}/stream",
+                             stream=True, timeout=(5, None)) as r:
+                r.raise_for_status()
+                for line in r.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        try:
+                            event = json.loads(line[6:])
+                            self._sse_event_queue.put(("sse", coord_url, event))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        self._sse_event_queue.put(("sse_disconnected", coord_url, None))
 
     def upload(self, coord_url, job_id, frame, render_time, image_path):
         files = {}
@@ -296,24 +317,100 @@ class Worker:
                "-f", str(frame)]
 
         start = time.time()
-        # FIX: Use binary mode + explicit UTF-8 decoding to avoid charmap errors
+        # Use binary mode + explicit UTF-8 decoding to avoid charmap errors
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         stdout_reader = io.TextIOWrapper(proc.stdout, encoding="utf-8",
                                           errors="replace", newline="")
+
+        was_cancelled = [False]
+        last_progress = [0]
+        render_done = threading.Event()
+
+        def _heartbeat_and_cancel_check():
+            """Background thread: keeps all coordinators updated and checks for cancel."""
+            while not render_done.wait(timeout=5):
+                # Keep this worker visible on ALL coordinators (fixes "offline" display bug)
+                for cu in self._get_coordinators():
+                    if cu != coord_url:
+                        try:
+                            requests.post(
+                                f"{cu}/api/workers/{self.id}/heartbeat",
+                                json={"status": "rendering",
+                                      "progress": last_progress[0]},
+                                timeout=5,
+                            )
+                        except Exception:
+                            pass
+                # Check SSE cancel events (faster path)
+                while True:
+                    try:
+                        src, cu, event = self._sse_event_queue.get_nowait()
+                        if src == "sse" and event and event.get("type") == "cancel":
+                            if event.get("job_id") == job_id and not was_cancelled[0]:
+                                print(f"  [CANCEL] frame {frame} cancelled via SSE")
+                                was_cancelled[0] = True
+                                try:
+                                    proc.kill()
+                                except Exception:
+                                    pass
+                        else:
+                            self._sse_event_queue.put((src, cu, event))
+                    except _queue.Empty:
+                        break
+                # Check cancel with the assigning coordinator
+                if not was_cancelled[0]:
+                    resp = self.report_progress(
+                        coord_url, job_id, frame, last_progress[0])
+                    if resp and resp.get("cancel"):
+                        print(f"  [CANCEL] frame {frame} cancelled — killing Blender")
+                        was_cancelled[0] = True
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+
+        hb_thread = threading.Thread(target=_heartbeat_and_cancel_check,
+                                     daemon=True, name=f"hb-{self.id}-f{frame}")
+        hb_thread.start()
+
         log_tail = []
         last_report = 0
         for line in stdout_reader:
+            if was_cancelled[0]:
+                break
             log_tail.append(line)
             if len(log_tail) > 400:
                 log_tail.pop(0)
             m = RE_SAMPLE.search(line) or RE_TILES.search(line)
             if m and time.time() - last_report > 1.0:
                 pct = int(100 * int(m.group(1)) / max(1, int(m.group(2))))
-                self.report_progress(coord_url, job_id, frame, pct)
+                last_progress[0] = pct
+                resp = self.report_progress(coord_url, job_id, frame, pct)
+                if resp:
+                    if resp.get("cancel"):
+                        print(f"  [CANCEL] frame {frame} cancelled — killing Blender")
+                        was_cancelled[0] = True
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    elif resp.get("prefetch"):
+                        for pa in (resp["prefetch"] or []):
+                            if len(self._prefetch_queue) < 4:
+                                self._prefetch_queue.append((coord_url, pa))
+                                print(f"  [PREFETCH] queued frame {pa['frame']}")
                 last_report = time.time()
+
         proc.wait()
+        render_done.set()
+        hb_thread.join(timeout=2)
         elapsed = round(time.time() - start, 1)
+
+        if was_cancelled[0]:
+            print(f"  [CANCEL] Frame {frame} render stopped after {elapsed}s")
+            self._prefetch_queue.clear()
+            return  # Coordinator already marked the frame as cancelled
 
         produced = sorted(outdir.glob("frame_*"))
         if proc.returncode != 0 or not produced:
@@ -349,23 +446,61 @@ class Worker:
                 continue
             break
 
-        print("  polling for work...")
+        print("  polling for work (SSE push enabled)...")
+        sse_started_for: set = set()
+
+        def _ensure_sse(cu):
+            if cu not in sse_started_for:
+                sse_started_for.add(cu)
+                threading.Thread(target=self._listen_sse, args=(cu,),
+                                 daemon=True, name=f"sse-{self.id}").start()
+
         while True:
             try:
-                coord_url, assign = self.poll_for_work()
-                if not assign:
-                    # Send heartbeat to all known coordinators
-                    for cu in self._get_coordinators():
-                        self.heartbeat(cu, "idle")
-                    # Wait for wake signal or timeout
-                    if self.discovery:
-                        woken = self.discovery.wait_for_wake(timeout=POLL_IDLE)
-                        if woken:
-                            continue  # immediately poll again
-                    else:
-                        time.sleep(POLL_IDLE)
+                # Priority 1: prefetch queue (zero latency between frames)
+                if self._prefetch_queue:
+                    cu, assign = self._prefetch_queue.pop(0)
+                    print(f"  [PREFETCH] starting frame {assign['frame']} immediately")
+                    self.render_frame(cu, assign)
                     continue
-                self.render_frame(coord_url, assign)
+
+                # Priority 2: process SSE events (non-blocking drain)
+                try:
+                    src, cu, event = self._sse_event_queue.get_nowait()
+                    if src == "sse_disconnected":
+                        sse_started_for.discard(cu)
+                    elif src == "sse" and event:
+                        if event["type"] == "work_available":
+                            coord_url, assign = self.poll_for_work()
+                            if assign:
+                                _ensure_sse(coord_url)
+                                self.render_frame(coord_url, assign)
+                    continue
+                except _queue.Empty:
+                    pass
+
+                # Priority 3: ensure SSE connected to all known coordinators
+                for cu in self._get_coordinators():
+                    _ensure_sse(cu)
+
+                # Priority 4: poll (first frame / belt-and-suspenders before SSE warms up)
+                coord_url, assign = self.poll_for_work()
+                if assign:
+                    self.render_frame(coord_url, assign)
+                    continue
+
+                # Idle: heartbeat all coordinators, then wait for SSE event or timeout
+                for cu in self._get_coordinators():
+                    self.heartbeat(cu, "idle")
+                if self.discovery:
+                    self.discovery.wait_for_wake(timeout=POLL_IDLE)
+                else:
+                    try:
+                        src, cu, event = self._sse_event_queue.get(timeout=POLL_IDLE)
+                        self._sse_event_queue.put((src, cu, event))
+                    except _queue.Empty:
+                        pass
+
             except KeyboardInterrupt:
                 print("\nstopping.")
                 return
