@@ -1,0 +1,15 @@
+.vscode/
+*.user
+*.suo
+bin/
+obj/
+out/
+node_modules/
+__pycache__/
+*.py[cod]
+env/
+venv/
+.venv/
+.DS_Store
+Thumbs.db
+.env

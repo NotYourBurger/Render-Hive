@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+RenderHive - Worker
+===================
+Runs on EVERY PC. Discovers all coordinators on the LAN and pulls
+frames from any that have work. For multi-GPU machines, one worker
+instance per GPU is spawned automatically.
+"""
+
+import os
+import re
+import io
+import sys
+import time
+import json
+import glob
+import random
+import socket
+import platform
+import argparse
+import tempfile
+import subprocess
+import shutil
+import threading
+from pathlib import Path
+
+import requests
+
+POLL_IDLE = 3.0
+
+# The script fed to Blender to configure output + GPU per frame
+GPU_SETUP_SCRIPT = r'''
+import bpy, os
+scene = bpy.context.scene
+
+out = os.environ.get("FARM_OUTPUT")
+if out:
+    scene.render.filepath = out
+fmt = os.environ.get("FARM_FORMAT")
+if fmt:
+    scene.render.image_settings.file_format = fmt
+eng = os.environ.get("FARM_ENGINE")
+if eng:
+    try:
+        scene.render.engine = eng
+    except Exception as e:
+        print("FARM: could not set engine", eng, e)
+
+samples = os.environ.get("FARM_SAMPLES")
+if samples and scene.render.engine == "CYCLES":
+    try:
+        scene.cycles.samples = int(samples)
+    except Exception:
+        pass
+
+device = os.environ.get("FARM_DEVICE", "")
+if scene.render.engine == "CYCLES":
+    if device == "CPU":
+        scene.cycles.device = "CPU"
+    elif device in ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL"):
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        prefs.compute_device_type = device
+        try:
+            prefs.refresh_devices()
+        except Exception:
+            pass
+        prefs.get_devices()
+        enabled = []
+        for d in prefs.devices:
+            d.use = (d.type == device)
+            if d.use:
+                enabled.append(d.name)
+        scene.cycles.device = "GPU"
+        print("FARM: device", device, "enabled:", enabled)
+print("FARM: engine", scene.render.engine, "device", getattr(scene.cycles, "device", "n/a"))
+'''
+
+
+BLENDER_50_PATH = r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
+
+
+def detect_blender():
+    """Return the path to Blender 5.0. Always prefers Blender 5.0."""
+    # 1. Explicit override via environment variable
+    env = os.environ.get("BLENDER")
+    if env and Path(env).exists():
+        return env
+    # 2. Blender 5.0 at the standard install location (preferred)
+    if Path(BLENDER_50_PATH).exists():
+        return BLENDER_50_PATH
+    # 3. Fallback: search PATH (but warn if it's not 5.0)
+    found = shutil.which("blender")
+    if found:
+        print(f"  WARNING: Blender 5.0 not found at {BLENDER_50_PATH}")
+        print(f"           Using fallback: {found}")
+        return found
+    return None
+
+
+def detect_gpu_name(gpu_index):
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL)
+        names = [n.strip() for n in out.strip().splitlines() if n.strip()]
+        if 0 <= gpu_index < len(names):
+            return names[gpu_index]
+        if names:
+            return names[0]
+    except Exception:
+        pass
+    return "GPU"
+
+
+def detect_gpu_count():
+    """Return number of NVIDIA GPUs, or 1 if detection fails."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL)
+        return max(1, len([n for n in out.strip().splitlines() if n.strip()]))
+    except Exception:
+        return 1
+
+
+def blender_version(blender):
+    try:
+        out = subprocess.check_output([blender, "--version"], text=True,
+                                      stderr=subprocess.DEVNULL)
+        return out.strip().splitlines()[0]
+    except Exception:
+        return "unknown"
+
+
+RE_SAMPLE = re.compile(r"Sample\s+(\d+)\s*/\s*(\d+)")
+RE_TILES  = re.compile(r"Rendered\s+(\d+)\s*/\s*(\d+)\s+Tiles")
+
+
+class Worker:
+    def __init__(self, gpu_index, device, blender, shared_root,
+                 name=None, discovery=None, server=None):
+        """
+        Args:
+            discovery: PeerDiscovery instance (for auto-discovery mode)
+            server: explicit coordinator URL (for manual/standalone mode)
+        """
+        self.gpu_index = gpu_index
+        self.device = device
+        self.blender = blender
+        self.shared_root = shared_root
+        self.discovery = discovery
+        self.server = server.rstrip("/") if server else None
+        hostname = socket.gethostname()
+        self.gpu_name = detect_gpu_name(gpu_index)
+        self.id = name or f"{hostname}-gpu{gpu_index}"
+        self.hostname = hostname
+        self.os_info = f"{platform.system()} {platform.release()}"
+        self.cache = Path(tempfile.gettempdir()) / "renderhive_cache" / self.id
+        self.cache.mkdir(parents=True, exist_ok=True)
+        self.setup_script = self.cache / "gpu_setup.py"
+        self.setup_script.write_text(GPU_SETUP_SCRIPT)
+        self.bversion = blender_version(blender)
+        self._registered_with = set()  # coordinator URLs we've registered with
+        self._wake_event = threading.Event()
+
+    def _worker_info(self):
+        """Worker info dict sent with registration and /next requests."""
+        return {
+            "id": self.id, "name": self.id,
+            "hostname": self.hostname,
+            "gpu_name": f"{self.gpu_name} (GPU {self.gpu_index})",
+            "os": self.os_info,
+            "blender_version": self.bversion,
+        }
+
+    def _get_coordinators(self):
+        """Return list of coordinator URLs to poll."""
+        if self.server:
+            return [self.server]
+        if self.discovery:
+            return self.discovery.get_all_coordinator_urls()
+        return ["http://127.0.0.1:8080"]
+
+    def register_with(self, coord_url):
+        """Register with a coordinator if not already done."""
+        if coord_url in self._registered_with:
+            return
+        try:
+            requests.post(f"{coord_url}/api/workers/register",
+                          json=self._worker_info(), timeout=10)
+            self._registered_with.add(coord_url)
+        except requests.RequestException:
+            pass
+
+    def heartbeat(self, coord_url, status, progress=0):
+        try:
+            requests.post(f"{coord_url}/api/workers/{self.id}/heartbeat",
+                          json={"status": status, "progress": progress},
+                          timeout=10)
+        except requests.RequestException:
+            pass
+
+    def poll_for_work(self):
+        """Poll all known coordinators for work. Returns (coord_url, assignment) or (None, None)."""
+        coordinators = self._get_coordinators()
+        random.shuffle(coordinators)  # distribute load
+        for coord_url in coordinators:
+            try:
+                self.register_with(coord_url)
+                r = requests.post(
+                    f"{coord_url}/api/workers/{self.id}/next",
+                    json=self._worker_info(), timeout=10)
+                data = r.json()
+                if data.get("reregister"):
+                    self._registered_with.discard(coord_url)
+                    self.register_with(coord_url)
+                    continue
+                if data.get("assignment"):
+                    return coord_url, data["assignment"]
+            except requests.RequestException:
+                self._registered_with.discard(coord_url)
+            except Exception:
+                pass
+        return None, None
+
+    def report_progress(self, coord_url, job_id, frame, progress):
+        try:
+            requests.post(f"{coord_url}/api/workers/{self.id}/progress",
+                          json={"job_id": job_id, "frame": frame,
+                                "progress": progress}, timeout=10)
+        except requests.RequestException:
+            pass
+
+    def report_fail(self, coord_url, job_id, frame, log):
+        try:
+            requests.post(f"{coord_url}/api/workers/{self.id}/fail",
+                          json={"job_id": job_id, "frame": frame, "log": log},
+                          timeout=20)
+        except requests.RequestException:
+            pass
+
+    def upload(self, coord_url, job_id, frame, render_time, image_path):
+        files = {}
+        if image_path and Path(image_path).exists():
+            files["image"] = (Path(image_path).name, open(image_path, "rb"))
+        requests.post(f"{coord_url}/api/workers/{self.id}/complete",
+                      data={"job_id": job_id, "frame": frame,
+                            "render_time": render_time},
+                      files=files, timeout=300)
+
+    def resolve_blend(self, coord_url, assign):
+        if assign.get("shared_path"):
+            sp = assign["shared_path"]
+            if self.shared_root and not os.path.isabs(sp):
+                sp = os.path.join(self.shared_root, sp)
+            if Path(sp).exists():
+                return sp
+            print(f"  ! shared_path not found: {sp} (falling back to download)")
+        local = self.cache / f"{assign['job_id']}_{assign['blend_filename']}"
+        if not local.exists():
+            print(f"  downloading {assign['blend_filename']} ...")
+            with requests.get(coord_url + assign["blend_url"],
+                              stream=True, timeout=600) as r:
+                r.raise_for_status()
+                tmp = local.with_suffix(local.suffix + ".part")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        f.write(chunk)
+                tmp.rename(local)
+        return str(local)
+
+    def render_frame(self, coord_url, assign):
+        job_id = assign["job_id"]
+        frame = assign["frame"]
+        print(f"\n[{time.strftime('%H:%M:%S')}] frame {frame} (job {job_id}) from {coord_url}")
+
+        blend = self.resolve_blend(coord_url, assign)
+        outdir = self.cache / "out"
+        outdir.mkdir(exist_ok=True)
+        for old in outdir.glob("*"):
+            old.unlink()
+        out_pattern = str(outdir / "frame_####")
+
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_index)
+        env["FARM_OUTPUT"] = out_pattern
+        env["FARM_FORMAT"] = assign.get("format") or "PNG"
+        env["FARM_DEVICE"] = self.device
+        if assign.get("engine"):
+            env["FARM_ENGINE"] = assign["engine"]
+        if assign.get("samples"):
+            env["FARM_SAMPLES"] = str(assign["samples"])
+
+        cmd = [self.blender, "-b", blend,
+               "-P", str(self.setup_script),
+               "-f", str(frame)]
+
+        start = time.time()
+        # FIX: Use binary mode + explicit UTF-8 decoding to avoid charmap errors
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        stdout_reader = io.TextIOWrapper(proc.stdout, encoding="utf-8",
+                                          errors="replace", newline="")
+        log_tail = []
+        last_report = 0
+        for line in stdout_reader:
+            log_tail.append(line)
+            if len(log_tail) > 400:
+                log_tail.pop(0)
+            m = RE_SAMPLE.search(line) or RE_TILES.search(line)
+            if m and time.time() - last_report > 1.0:
+                pct = int(100 * int(m.group(1)) / max(1, int(m.group(2))))
+                self.report_progress(coord_url, job_id, frame, pct)
+                last_report = time.time()
+        proc.wait()
+        elapsed = round(time.time() - start, 1)
+
+        produced = sorted(outdir.glob("frame_*"))
+        if proc.returncode != 0 or not produced:
+            log = "".join(log_tail)
+            print(f"  FAILED (rc={proc.returncode}, {elapsed}s)")
+            self.report_fail(coord_url, job_id, frame, log)
+            return
+        print(f"  done in {elapsed}s -> uploading {produced[0].name}")
+        self.upload(coord_url, job_id, frame, elapsed, str(produced[0]))
+
+    def wake(self):
+        """Signal this worker to immediately poll for work."""
+        self._wake_event.set()
+
+    def run(self):
+        print(f"Worker '{self.id}'  GPU={self.gpu_name} (index {self.gpu_index})"
+              f"  device={self.device}")
+        print(f"Blender: {self.blender} [{self.bversion}]")
+
+        # Wait for at least one coordinator to be available
+        print("  waiting for coordinator...")
+        while True:
+            coordinators = self._get_coordinators()
+            for coord_url in coordinators:
+                try:
+                    self.register_with(coord_url)
+                    print(f"  registered with {coord_url}")
+                    break
+                except Exception:
+                    pass
+            else:
+                time.sleep(2)
+                continue
+            break
+
+        print("  polling for work...")
+        while True:
+            try:
+                coord_url, assign = self.poll_for_work()
+                if not assign:
+                    # Send heartbeat to all known coordinators
+                    for cu in self._get_coordinators():
+                        self.heartbeat(cu, "idle")
+                    # Wait for wake signal or timeout
+                    if self.discovery:
+                        woken = self.discovery.wait_for_wake(timeout=POLL_IDLE)
+                        if woken:
+                            continue  # immediately poll again
+                    else:
+                        time.sleep(POLL_IDLE)
+                    continue
+                self.render_frame(coord_url, assign)
+            except KeyboardInterrupt:
+                print("\nstopping.")
+                return
+            except requests.RequestException as e:
+                print("  network error:", e)
+                time.sleep(POLL_IDLE)
+            except Exception as e:
+                print("  worker error:", e)
+                time.sleep(POLL_IDLE)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="RenderHive worker")
+    ap.add_argument("--server", default=None,
+                    help="coordinator URL (e.g. http://192.168.1.10:8080). "
+                         "If omitted, uses auto-discovery.")
+    ap.add_argument("--gpu", type=int, default=0,
+                    help="GPU index to use (run one worker per GPU)")
+    ap.add_argument("--device", default="OPTIX",
+                    choices=["OPTIX", "CUDA", "HIP", "ONEAPI", "METAL", "CPU"],
+                    help="Cycles backend (OPTIX is fastest on RTX cards)")
+    ap.add_argument("--name", default=None, help="override worker name")
+    ap.add_argument("--blender", default=None, help="path to blender executable")
+    ap.add_argument("--shared-root", default=None,
+                    help="local mount point of the shared project folder, if used")
+    ap.add_argument("--discovery-port", type=int, default=5678,
+                    help="UDP port for peer discovery")
+    ap.add_argument("--http-port", type=int, default=8080,
+                    help="HTTP port of the local coordinator (for discovery)")
+    args = ap.parse_args()
+
+    blender = args.blender or detect_blender()
+    if not blender:
+        print("ERROR: could not find Blender. Pass --blender <path-to-blender.exe>")
+        sys.exit(1)
+
+    discovery = None
+    if not args.server:
+        # Auto-discovery mode
+        import uuid
+        from discovery import PeerDiscovery
+        node_id = uuid.uuid4().hex[:12]
+        discovery = PeerDiscovery(node_id, args.http_port,
+                                  discovery_port=args.discovery_port)
+        discovery.start()
+        print(f"  discovery started on UDP port {args.discovery_port}")
+
+    Worker(gpu_index=args.gpu, device=args.device, blender=blender,
+           shared_root=args.shared_root, name=args.name,
+           discovery=discovery, server=args.server).run()
+
+
+if __name__ == "__main__":
+    main()
