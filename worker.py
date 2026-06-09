@@ -77,23 +77,39 @@ print("FARM: engine", scene.render.engine, "device", getattr(scene.cycles, "devi
 '''
 
 
-BLENDER_50_PATH = r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
-
-
 def detect_blender():
-    """Return the path to Blender 5.0. Always prefers Blender 5.0."""
+    """Return path to the latest installed Blender 5.x. Falls back to PATH."""
+    import re as _re
     # 1. Explicit override via environment variable
     env = os.environ.get("BLENDER")
     if env and Path(env).exists():
         return env
-    # 2. Blender 5.0 at the standard install location (preferred)
-    if Path(BLENDER_50_PATH).exists():
-        return BLENDER_50_PATH
-    # 3. Fallback: search PATH (but warn if it's not 5.0)
+    # 2. Scan Windows install directory for any Blender 5.x
+    base = Path(r"C:\Program Files\Blender Foundation")
+    if base.exists():
+        candidates = []
+        for d in base.iterdir():
+            if not d.is_dir():
+                continue
+            m = _re.match(r"Blender (\d+)\.(\d+)", d.name)
+            if m:
+                major, minor = int(m.group(1)), int(m.group(2))
+                if major == 5:
+                    exe = d / "blender.exe"
+                    if exe.exists():
+                        candidates.append((minor, str(exe)))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)  # highest 5.x first
+            chosen = candidates[0][1]
+            if len(candidates) > 1:
+                all_paths = [c[1] for c in candidates]
+                print(f"  Found Blender 5.x installs: {all_paths}")
+                print(f"  Using: {chosen}")
+            return chosen
+    # 3. Fallback: search PATH
     found = shutil.which("blender")
     if found:
-        print(f"  WARNING: Blender 5.0 not found at {BLENDER_50_PATH}")
-        print(f"           Using fallback: {found}")
+        print(f"  WARNING: No Blender 5.x found in Program Files, using: {found}")
         return found
     return None
 

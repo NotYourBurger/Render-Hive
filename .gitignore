@@ -13,3 +13,5 @@ venv/
 .DS_Store
 Thumbs.db
 .env
+config.json
+state.json

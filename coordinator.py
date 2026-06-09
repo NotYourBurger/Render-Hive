@@ -66,23 +66,38 @@ BLENDER_PATH = None   # path to blender executable
 # ---------------------------------------------------------------------------
 # Blender detection (for probing blend files)
 # ---------------------------------------------------------------------------
-BLENDER_50_PATH = r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe"
-
-
 def detect_blender():
-    """Return the path to Blender 5.0. Always prefers Blender 5.0."""
+    """Return path to the latest installed Blender 5.x. Falls back to PATH."""
     # 1. Explicit override via environment variable
     env = os.environ.get("BLENDER")
     if env and Path(env).exists():
         return env
-    # 2. Blender 5.0 at the standard install location (preferred)
-    if Path(BLENDER_50_PATH).exists():
-        return BLENDER_50_PATH
-    # 3. Fallback: search PATH (but warn if it's not 5.0)
+    # 2. Scan Windows install directory for any Blender 5.x
+    base = Path(r"C:\Program Files\Blender Foundation")
+    if base.exists():
+        candidates = []
+        for d in base.iterdir():
+            if not d.is_dir():
+                continue
+            m = re.match(r"Blender (\d+)\.(\d+)", d.name)
+            if m:
+                major, minor = int(m.group(1)), int(m.group(2))
+                if major == 5:
+                    exe = d / "blender.exe"
+                    if exe.exists():
+                        candidates.append((minor, str(exe)))
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)  # highest 5.x first
+            chosen = candidates[0][1]
+            if len(candidates) > 1:
+                all_paths = [c[1] for c in candidates]
+                print(f"  Found Blender 5.x installs: {all_paths}")
+                print(f"  Using: {chosen}")
+            return chosen
+    # 3. Fallback: search PATH
     found = shutil.which("blender")
     if found:
-        print(f"  WARNING: Blender 5.0 not found at {BLENDER_50_PATH}")
-        print(f"           Using fallback: {found}")
+        print(f"  WARNING: No Blender 5.x found in Program Files, using: {found}")
         return found
     return None
 
@@ -194,6 +209,16 @@ def _push_worker_event(wid, event):
             q.put_nowait(event)
         except _queue.Full:
             pass
+
+
+def _notify_idle_workers_sse(exclude_wid=None):
+    """Push work_available to all idle SSE-connected workers. Call inside LOCK."""
+    for _wid in list(WORKER_SSE_QUEUES.keys()):
+        if _wid == exclude_wid:
+            continue
+        w = WORKERS.get(_wid)
+        if w and w["status"] == "idle":
+            _push_worker_event(_wid, {"type": "work_available"})
 
 
 def _broadcast_dashboard(event):
@@ -324,6 +349,7 @@ def reap_dead_workers_and_frames():
                     w["current_job"] = None
                     w["current_frame"] = None
                     w["progress"] = 0
+            frames_recovered = False
             for job in JOBS.values():
                 if job["status"] not in ("rendering", "queued"):
                     continue
@@ -346,8 +372,11 @@ def reap_dead_workers_and_frames():
                             fr["status"] = "failed"
                         else:
                             fr["status"] = "pending"
+                            frames_recovered = True
                         fr["worker"] = None
                         fr["progress"] = 0
+            if frames_recovered:
+                _notify_idle_workers_sse()
             # Work stealing: reclaim low-progress frames from abnormally slow workers
             # Only when at least one idle worker is waiting for work
             idle_workers = [w for w in WORKERS.values()
@@ -933,8 +962,9 @@ def api_complete(wid):
                     w["render_times"] = w["render_times"][-100:]
         if not is_cancelled:
             _recompute_job_statuses()
-        # Push SSE events regardless of cancel status
+        # Notify completing worker + all other idle workers about available work
         _push_worker_event(wid, {"type": "work_available"})
+        _notify_idle_workers_sse(exclude_wid=wid)
         if not is_cancelled:
             _broadcast_dashboard({"type": "frame_done", "job_id": job_id, "frame": frame})
     save_state()
