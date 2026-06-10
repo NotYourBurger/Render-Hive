@@ -78,13 +78,13 @@ print("FARM: engine", scene.render.engine, "device", getattr(scene.cycles, "devi
 
 
 def detect_blender():
-    """Return path to the latest installed Blender 5.x. Falls back to PATH."""
+    """Return path to the newest installed Blender (4.0+). Falls back to PATH."""
     import re as _re
     # 1. Explicit override via environment variable
     env = os.environ.get("BLENDER")
     if env and Path(env).exists():
         return env
-    # 2. Scan Windows install directory for any Blender 5.x
+    # 2. Scan Windows install directory for the highest Blender version
     base = Path(r"C:\Program Files\Blender Foundation")
     if base.exists():
         candidates = []
@@ -94,22 +94,22 @@ def detect_blender():
             m = _re.match(r"Blender (\d+)\.(\d+)", d.name)
             if m:
                 major, minor = int(m.group(1)), int(m.group(2))
-                if major == 5:
+                if major >= 4:
                     exe = d / "blender.exe"
                     if exe.exists():
-                        candidates.append((minor, str(exe)))
+                        candidates.append(((major, minor), str(exe)))
         if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)  # highest 5.x first
+            candidates.sort(key=lambda x: x[0], reverse=True)  # newest first
             chosen = candidates[0][1]
             if len(candidates) > 1:
                 all_paths = [c[1] for c in candidates]
-                print(f"  Found Blender 5.x installs: {all_paths}")
+                print(f"  Found Blender installs: {all_paths}")
                 print(f"  Using: {chosen}")
             return chosen
     # 3. Fallback: search PATH
     found = shutil.which("blender")
     if found:
-        print(f"  WARNING: No Blender 5.x found in Program Files, using: {found}")
+        print(f"  WARNING: No Blender 4+ found in Program Files, using: {found}")
         return found
     return None
 
@@ -277,13 +277,28 @@ class Worker:
         self._sse_event_queue.put(("sse_disconnected", coord_url, None))
 
     def upload(self, coord_url, job_id, frame, render_time, image_path):
-        files = {}
-        if image_path and Path(image_path).exists():
-            files["image"] = (Path(image_path).name, open(image_path, "rb"))
-        requests.post(f"{coord_url}/api/workers/{self.id}/complete",
-                      data={"job_id": job_id, "frame": frame,
-                            "render_time": render_time},
-                      files=files, timeout=300)
+        """Upload a finished frame. Retries; returns True on success."""
+        for attempt in range(3):
+            try:
+                data = {"job_id": job_id, "frame": frame,
+                        "render_time": render_time}
+                if image_path and Path(image_path).exists():
+                    with open(image_path, "rb") as fh:
+                        r = requests.post(
+                            f"{coord_url}/api/workers/{self.id}/complete",
+                            data=data,
+                            files={"image": (Path(image_path).name, fh)},
+                            timeout=300)
+                else:
+                    r = requests.post(
+                        f"{coord_url}/api/workers/{self.id}/complete",
+                        data=data, timeout=300)
+                r.raise_for_status()
+                return True
+            except (requests.RequestException, OSError) as e:
+                print(f"  upload attempt {attempt + 1}/3 failed: {e}")
+                time.sleep(2 * (attempt + 1))
+        return False
 
     def resolve_blend(self, coord_url, assign):
         if assign.get("shared_path"):
@@ -307,6 +322,16 @@ class Worker:
         return str(local)
 
     def render_frame(self, coord_url, assign):
+        """Render one frame; on any unexpected error tell the coordinator so
+        the frame is requeued immediately instead of waiting for a timeout."""
+        try:
+            self._render_frame_inner(coord_url, assign)
+        except Exception as e:
+            print(f"  worker error on frame {assign.get('frame')}: {e}")
+            self.report_fail(coord_url, assign["job_id"], assign["frame"],
+                             f"worker exception: {e}")
+
+    def _render_frame_inner(self, coord_url, assign):
         job_id = assign["job_id"]
         frame = assign["frame"]
         print(f"\n[{time.strftime('%H:%M:%S')}] frame {frame} (job {job_id}) from {coord_url}")
@@ -435,7 +460,10 @@ class Worker:
             self.report_fail(coord_url, job_id, frame, log)
             return
         print(f"  done in {elapsed}s -> uploading {produced[0].name}")
-        self.upload(coord_url, job_id, frame, elapsed, str(produced[0]))
+        if not self.upload(coord_url, job_id, frame, elapsed, str(produced[0])):
+            print(f"  upload of frame {frame} failed — reporting failure")
+            self.report_fail(coord_url, job_id, frame,
+                             "frame rendered but upload to coordinator failed")
 
     def wake(self):
         """Signal this worker to immediately poll for work."""

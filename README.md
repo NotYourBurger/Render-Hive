@@ -121,13 +121,33 @@ libraries, or very large textures that don't pack.
 ## Features that make it not-annoying
 
 - **Auto load-balancing** — pull-based scheduling; fast GPUs simply take more frames.
+- **Job priorities** — Low / Normal / High / Urgent per job; the farm always works
+  the highest-priority job first (FIFO within the same priority). Change priority
+  any time via the API.
+- **Pause / resume** — pause a job (in-flight frames finish, no new ones start) or
+  pause an individual render node from the dashboard.
+- **Blend-cache affinity** — a worker prefers frames from the job whose .blend it
+  already downloaded, avoiding repeated transfers (never overrides priority).
 - **Resume** — "Skip already-rendered frames" is on by default, so a re-run only
   fills in the gaps. Crash-safe.
-- **Dead-node recovery** — if a worker drops mid-frame, that frame is automatically
-  requeued to another node (up to 3 attempts) so the job still finishes.
+- **Crash recovery** — three independent safety nets reassign lost frames to
+  working PCs:
+  - *offline*: a node stops heartbeating → its frames requeue within ~60 s
+  - *orphaned*: a node crashed mid-frame and came back idle → requeued in ~30 s
+    (doesn't count against the frame's retry limit)
+  - *stalled*: a node heartbeats but the render makes no progress for 5 min → requeued
+- **Work stealing** — a frame stuck on an abnormally slow node is reclaimed when a
+  faster node sits idle.
+- **Per-frame requeue** — force any failed or stuck frame back into the queue from
+  the frame table (↻ button).
 - **Live per-frame progress** — sample/tile counts are parsed from Blender and shown.
-- **ETA** — estimated from average frame time and active node count.
-- **Survives coordinator restart** — jobs persist to `farm_data/state.json`.
+- **Clear ETA** — computed from the actual speed of the workers on the job, credits
+  partial progress of in-flight frames, includes queue wait for jobs behind others,
+  and shows the wall-clock finish time ("→ done 14:32").
+- **Selectable output folder** — per job in the submit form, plus a farm-wide
+  default in ⚙ Settings.
+- **Survives coordinator restart** — jobs persist (atomically) to
+  `Documents\RenderHive\state.json`.
 
 ---
 
@@ -146,8 +166,12 @@ python worker.py --server URL [--gpu N] [--device OPTIX|CUDA|CPU]
 - `--blender` — only needed if auto-detect fails; point it at `blender.exe`.
 - `--shared-root` — if your shared path is relative on workers, this is its mount root.
 
-Everything the coordinator stores lives in `./farm_data/`
-(`blends/` = uploaded files, `output/<jobname>/` = rendered frames).
+Everything the coordinator stores lives in `Documents\RenderHive\`
+(`blends/` = uploaded files, `output/<jobname>/` = rendered frames,
+`state.json` / `settings.json` / `config.json` = farm state and settings).
+Existing data from the old `./farm_data/` location is migrated automatically on
+first run. Set the `RENDERHIVE_DATA_DIR` environment variable to store data
+somewhere else.
 
 ---
 

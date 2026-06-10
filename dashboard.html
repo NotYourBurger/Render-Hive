@@ -3,1399 +3,1051 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RenderHive — P2P GPU Render Farm</title>
+<title>RenderHive — Distributed Render Farm</title>
+<script>
+/* Apply saved theme before first paint to avoid flash */
+(function () {
+  var t = new URLSearchParams(location.search).get('theme');
+  if (t !== 'light' && t !== 'dark') {
+    t = null;
+    try { t = localStorage.getItem('rh-theme'); } catch (e) {}
+  }
+  if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-/* ═══════════════════════════════════════════════════════════
-   CSS CUSTOM PROPERTIES & RESET
-   ═══════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+   DESIGN TOKENS — dark (default) & light themes
+   ════════════════════════════════════════════════════════════ */
 :root {
-  --bg: #0a0c10;
-  --panel: #121620;
-  --panel2: #171c28;
-  --panel3: #1c2235;
-  --line: #222a38;
-  --txt: #c9d4e3;
-  --dim: #6b7689;
-  --accent: #39ff8b;
-  --accent2: #1fd1ff;
-  --accent3: #a78bfa;
-  --warn: #ffcf4d;
-  --bad: #ff5c6c;
-  --idle: #46506a;
-  --glow-accent: rgba(57,255,139,.15);
-  --glow-accent2: rgba(31,209,255,.15);
-  --radius: 10px;
-  --radius-sm: 6px;
-  --transition: .25s cubic-bezier(.4,0,.2,1);
+  --bg: #0b0d10;
+  --bg-soft: #0e1114;
+  --panel: #14171c;
+  --panel-2: #191d23;
+  --panel-3: #20252d;
+  --line: rgba(255,255,255,.065);
+  --line-strong: rgba(255,255,255,.12);
+  --txt: #e9edf1;
+  --dim: #8b939d;
+  --faint: #5b636d;
+
+  --accent: #9fe8cf;          /* mint — primary accent */
+  --accent-strong: #54d6a8;
+  --accent-ink: #07261c;      /* text on mint */
+  --accent-soft: rgba(122,228,191,.12);
+  --blue: #82b6ff;
+  --blue-soft: rgba(130,182,255,.12);
+  --violet: #b9a6f7;
+  --violet-soft: rgba(185,166,247,.12);
+  --warn: #f0c46a;
+  --warn-soft: rgba(240,196,106,.12);
+  --bad: #f08294;
+  --bad-soft: rgba(240,130,148,.12);
+
+  --r-lg: 20px;
+  --r-md: 14px;
+  --r-sm: 10px;
+  --r-pill: 999px;
+  --shadow: 0 10px 30px rgba(0,0,0,.35);
+  --shadow-soft: 0 4px 16px rgba(0,0,0,.25);
+  --ease: cubic-bezier(.4,0,.2,1);
+  --net-grid: rgba(255,255,255,.045);
+  --net-line: rgba(122,228,191,.28);
+  --net-line-faint: rgba(139,147,157,.14);
+  --glass: rgba(20,23,28,.72);
 }
 
+[data-theme="light"] {
+  --bg: #eef1f4;
+  --bg-soft: #e9edf0;
+  --panel: #ffffff;
+  --panel-2: #f5f7f9;
+  --panel-3: #edf0f3;
+  --line: rgba(15,23,32,.08);
+  --line-strong: rgba(15,23,32,.16);
+  --txt: #161c23;
+  --dim: #5f6873;
+  --faint: #9aa3ad;
+
+  --accent: #0fae85;
+  --accent-strong: #0a9573;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(15,174,133,.1);
+  --blue: #2f6fd0;
+  --blue-soft: rgba(47,111,208,.1);
+  --violet: #7a5fd0;
+  --violet-soft: rgba(122,95,208,.1);
+  --warn: #b97f14;
+  --warn-soft: rgba(214,158,46,.14);
+  --bad: #d2455c;
+  --bad-soft: rgba(210,69,92,.1);
+
+  --shadow: 0 10px 30px rgba(22,30,40,.10);
+  --shadow-soft: 0 4px 14px rgba(22,30,40,.08);
+  --net-grid: rgba(15,23,32,.05);
+  --net-line: rgba(15,174,133,.35);
+  --net-line-faint: rgba(95,104,115,.16);
+  --glass: rgba(255,255,255,.78);
+}
+
+/* ════════════════════════════════════════════════════════════
+   BASE
+   ════════════════════════════════════════════════════════════ */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-html { font-size: 14px; scroll-behavior: smooth; }
+html { font-size: 15px; scroll-behavior: smooth; }
 
 body {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: 'Inter', system-ui, sans-serif;
   background: var(--bg);
   color: var(--txt);
   min-height: 100vh;
-  overflow-x: hidden;
-  /* Subtle grid background pattern */
-  background-image:
-    linear-gradient(rgba(34,42,56,.35) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(34,42,56,.35) 1px, transparent 1px);
-  background-size: 40px 40px;
-  background-position: -1px -1px;
+  -webkit-font-smoothing: antialiased;
+  transition: background .3s var(--ease), color .3s var(--ease);
 }
 
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: var(--panel); }
-::-webkit-scrollbar-thumb { background: var(--idle); border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+.mono { font-family: 'JetBrains Mono', monospace; }
 
-/* ═══════════════════════════════════════════════════════════
-   ANIMATIONS
-   ═══════════════════════════════════════════════════════════ */
-@keyframes pulse-dot {
-  0%, 100% { opacity: 1; box-shadow: 0 0 4px currentColor; }
-  50% { opacity: .4; box-shadow: 0 0 12px currentColor; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+
+/* transform-only: content stays visible even if animations are paused */
+@keyframes fade-up { from { transform: translateY(12px); } to { transform: none; } }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+@keyframes ring-pulse {
+  0%   { transform: translate(-50%,-50%) scale(.6); opacity: .5; }
+  100% { transform: translate(-50%,-50%) scale(1.9); opacity: 0; }
 }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes shimmer { 0% { background-position: -400px 0; } 100% { background-position: 400px 0; } }
 
-@keyframes pulse-border {
-  0%, 100% { border-color: rgba(57,255,139,.25); }
-  50% { border-color: rgba(57,255,139,.55); }
-}
+/* Entrance animation only during the initial load; the resting state is
+   always fully visible so re-renders and screenshots never catch opacity 0 */
+.fade-up { opacity: 1; }
+body:not(.loaded) .fade-up { animation: fade-up .45s var(--ease); }
 
-@keyframes scan-dots {
-  0% { content: ''; }
-  25% { content: '.'; }
-  50% { content: '..'; }
-  75% { content: '...'; }
-}
-
-@keyframes fade-in {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes slide-down {
-  from { max-height: 0; opacity: 0; }
-  to { max-height: 4000px; opacity: 1; }
-}
-
-@keyframes shimmer {
-  0% { background-position: -400px 0; }
-  100% { background-position: 400px 0; }
-}
-
-@keyframes hex-rotate {
-  0% { transform: rotate(0deg); }
-  100% { transform: rotate(360deg); }
-}
-
-@keyframes progress-glow {
-  0%, 100% { filter: brightness(1); }
-  50% { filter: brightness(1.3); }
-}
-
-.fade-in { animation: fade-in .4s ease both; }
-
-/* After initial load, suppress fade-in so poll updates don't cause jumps */
-body.loaded .fade-in { animation: none; }
-
-/* Skeleton loading */
 .skeleton {
-  background: linear-gradient(90deg, var(--panel2) 25%, var(--panel3) 50%, var(--panel2) 75%);
+  background: linear-gradient(90deg, var(--panel-2) 25%, var(--panel-3) 50%, var(--panel-2) 75%);
   background-size: 800px 100%;
-  animation: shimmer 1.5s infinite linear;
-  border-radius: var(--radius-sm);
+  animation: shimmer 1.4s infinite linear;
+  border-radius: var(--r-sm);
 }
 
-/* ═══════════════════════════════════════════════════════════
-   LAYOUT
-   ═══════════════════════════════════════════════════════════ */
-.container {
-  max-width: 1600px;
-  margin: 0 auto;
-  padding: 0 24px 60px;
-}
+/* ════════════════════════════════════════════════════════════
+   APP SHELL — slim icon rail + main column
+   ════════════════════════════════════════════════════════════ */
+.shell { display: flex; min-height: 100vh; }
 
-section {
-  margin-bottom: 32px;
-}
-
-.section-header {
+.rail {
+  position: sticky; top: 0;
+  height: 100vh;
+  width: 72px;
+  flex-shrink: 0;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 16px;
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--line);
+  gap: 8px;
+  padding: 18px 0;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  z-index: 50;
 }
 
-.section-header h2 {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: 1.15rem;
-  letter-spacing: .06em;
-  text-transform: uppercase;
-  color: var(--txt);
-}
-
-.section-icon {
-  width: 28px; height: 28px;
+.rail-logo {
+  width: 40px; height: 40px;
+  border-radius: 13px;
   display: flex; align-items: center; justify-content: center;
-  border-radius: var(--radius-sm);
-  background: var(--panel2);
-  border: 1px solid var(--line);
-  font-size: 14px;
+  font-size: 19px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: var(--accent-ink);
+  box-shadow: 0 6px 18px rgba(84,214,168,.25);
+  margin-bottom: 14px;
+  flex-shrink: 0;
 }
 
-.section-count {
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .8rem;
-  padding: 2px 8px;
-  border-radius: 99px;
-  background: var(--panel3);
-  color: var(--dim);
-  margin-left: auto;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   HEADER
-   ═══════════════════════════════════════════════════════════ */
-header {
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  background: rgba(10,12,16,.85);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border-bottom: 1px solid var(--line);
-  padding: 14px 24px;
-}
-
-.header-inner {
-  max-width: 1600px;
-  margin: 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  flex-wrap: wrap;
-}
-
-/* Hexagonal CSS-only logo */
-.hex-logo {
-  position: relative;
+.rail-btn {
   width: 42px; height: 42px;
-  flex-shrink: 0;
-}
-
-.hex-logo .hex-outer {
-  position: absolute;
-  inset: 0;
-  clip-path: polygon(50% 0%, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%);
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
-}
-
-.hex-logo .hex-inner {
-  position: absolute;
-  inset: 3px;
-  clip-path: polygon(50% 0%, 93% 25%, 93% 75%, 50% 100%, 7% 75%, 7% 25%);
-  background: var(--bg);
+  border-radius: 13px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--dim);
+  font-size: 17px;
   display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: all .2s var(--ease);
+  text-decoration: none;
 }
 
-.hex-logo .hex-inner::after {
-  content: '⬡';
-  font-size: 16px;
-  color: var(--accent);
-  filter: drop-shadow(0 0 6px var(--accent));
+.rail-btn:hover { background: var(--panel-3); color: var(--txt); }
+.rail-btn.active { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.rail-spacer { flex: 1; }
+
+.rail-tip { position: relative; }
+.rail-tip::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 54px; top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
+  font-size: .72rem; font-weight: 600;
+  padding: 6px 10px;
+  background: var(--panel-3);
+  border: 1px solid var(--line);
+  color: var(--txt);
+  border-radius: 8px;
+  opacity: 0; pointer-events: none;
+  transition: opacity .15s;
+  z-index: 60;
+}
+.rail-tip:hover::after { opacity: 1; }
+
+.main {
+  flex: 1;
+  min-width: 0;
+  max-width: 1480px;
+  padding: 26px 34px 80px;
+  margin: 0 auto;
 }
 
-.header-title {
+/* ════════════════════════════════════════════════════════════
+   TOP BAR — title, big stats, primary action
+   ════════════════════════════════════════════════════════════ */
+.topbar {
   display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.header-title h1 {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 700;
-  font-size: 1.4rem;
-  letter-spacing: .12em;
-  background: linear-gradient(90deg, var(--accent), var(--accent2));
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-  background-clip: text;
-  line-height: 1;
-}
-
-.header-title .subtitle {
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .65rem;
-  letter-spacing: .18em;
-  color: var(--dim);
-  text-transform: uppercase;
-}
-
-.header-stats {
-  display: flex;
-  gap: 20px;
-  margin-left: auto;
-  flex-wrap: wrap;
-}
-
-.header-stat {
-  display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: 22px;
+  flex-wrap: wrap;
+  margin-bottom: 26px;
 }
 
-.header-stat .stat-value {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 700;
-  font-size: 1.2rem;
-  color: var(--accent);
-  line-height: 1;
+.topbar h1 {
+  font-size: 1.45rem;
+  font-weight: 800;
+  letter-spacing: -.02em;
 }
 
-.header-stat .stat-label {
-  font-size: .6rem;
-  letter-spacing: .1em;
-  text-transform: uppercase;
+.node-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: .76rem; font-weight: 600;
   color: var(--dim);
-}
-
-.connection-indicator {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 8px var(--accent);
-  flex-shrink: 0;
-  transition: background var(--transition), box-shadow var(--transition);
-}
-
-.connection-indicator.error {
-  background: var(--bad);
-  box-shadow: 0 0 8px var(--bad);
-  animation: pulse-dot 1s infinite;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   PEER CARDS
-   ═══════════════════════════════════════════════════════════ */
-.peers-scroll {
-  display: flex;
-  gap: 12px;
-  overflow-x: auto;
-  padding: 4px 0 12px;
-}
-
-.peer-card {
-  flex: 0 0 220px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 14px;
+  padding: 6px 13px;
+  border-radius: var(--r-pill);
+}
+.node-chip .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent-strong);
+  box-shadow: 0 0 8px var(--accent-strong);
+}
+.node-chip .dot.error { background: var(--bad); box-shadow: 0 0 8px var(--bad); animation: pulse 1s infinite; }
+
+.topbar-stats {
+  display: flex;
+  gap: 34px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.tstat { display: flex; flex-direction: column; gap: 1px; }
+.tstat .v {
+  font-size: 1.5rem; font-weight: 800; letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+.tstat .v .unit { font-size: .8rem; font-weight: 600; color: var(--dim); margin-left: 3px; }
+.tstat .l { font-size: .7rem; font-weight: 600; color: var(--dim); }
+
+/* ════════════════════════════════════════════════════════════
+   BUTTONS
+   ════════════════════════════════════════════════════════════ */
+.btn {
+  font-family: 'Inter', sans-serif;
+  font-weight: 600;
+  font-size: .82rem;
+  padding: 9px 17px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--txt);
   cursor: pointer;
-  transition: all var(--transition);
-  text-decoration: none;
-  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+  transition: all .2s var(--ease);
+}
+.btn:hover { border-color: var(--line-strong); background: var(--panel-2); transform: translateY(-1px); }
+.btn:active { transform: none; }
+
+.btn.primary {
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  border-color: transparent;
+  color: var(--accent-ink);
+  box-shadow: 0 6px 18px rgba(84,214,168,.25);
+}
+.btn.primary:hover { filter: brightness(1.05); box-shadow: 0 8px 22px rgba(84,214,168,.35); }
+
+.btn.danger { color: var(--bad); }
+.btn.danger:hover { border-color: var(--bad); background: var(--bad-soft); }
+
+.btn.small { font-size: .73rem; padding: 6px 12px; }
+.btn.icon { padding: 6px 9px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; pointer-events: none; }
+
+/* ════════════════════════════════════════════════════════════
+   CARDS / SECTIONS
+   ════════════════════════════════════════════════════════════ */
+section { margin-bottom: 26px; scroll-margin-top: 20px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-soft);
+  transition: background .3s var(--ease), border-color .3s var(--ease);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 22px 0;
+}
+
+.card-head h2 { font-size: 1.02rem; font-weight: 700; letter-spacing: -.01em; }
+
+.count-pill {
+  font-size: .72rem; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  background: var(--panel-3);
+  color: var(--dim);
+}
+
+.card-head .head-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+.card-body { padding: 18px 22px 22px; }
+
+/* ════════════════════════════════════════════════════════════
+   NETWORK TOPOLOGY — floating PC bubbles, mesh links
+   ════════════════════════════════════════════════════════════ */
+.net-stage {
   position: relative;
+  height: 340px;
+  border-radius: var(--r-md);
+  background:
+    radial-gradient(ellipse 60% 55% at 50% 45%, var(--accent-soft), transparent 70%),
+    radial-gradient(circle, var(--net-grid) 1px, transparent 1.5px);
+  background-size: 100% 100%, 26px 26px;
+  border: 1px solid var(--line);
   overflow: hidden;
 }
 
-.peer-card::before {
-  content: '';
+.net-svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.net-svg line.mesh { stroke: var(--net-line-faint); stroke-width: 1; }
+.net-svg line.link { stroke: var(--net-line); stroke-width: 1.5; stroke-dasharray: 5 7; }
+.net-svg circle.packet { fill: var(--accent-strong); filter: drop-shadow(0 0 4px var(--accent-strong)); }
+
+.net-node {
   position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, var(--accent2), transparent);
-  opacity: 0;
-  transition: opacity var(--transition);
-}
-
-.peer-card:hover {
-  border-color: var(--accent2);
-  transform: translateY(-2px);
-  box-shadow: 0 4px 20px rgba(31,209,255,.1);
-}
-
-.peer-card:hover::before { opacity: 1; }
-
-.peer-card.self-peer {
-  border-color: rgba(57,255,139,.3);
-  background: linear-gradient(135deg, rgba(57,255,139,.05), var(--panel));
-}
-
-.peer-card.self-peer::before {
-  opacity: 1;
-  background: linear-gradient(90deg, var(--accent), transparent);
-}
-
-.peer-name {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: .9rem;
-  margin-bottom: 4px;
+  left: 0; top: 0;
+  width: 108px;
+  margin-left: -54px;   /* center on (x,y) */
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
+  text-decoration: none;
+  color: inherit;
+  will-change: transform;
+  z-index: 2;
 }
 
-.peer-name .self-badge {
-  font-size: .55rem;
-  padding: 1px 5px;
-  border-radius: 3px;
-  background: rgba(57,255,139,.15);
-  color: var(--accent);
-  text-transform: uppercase;
-  letter-spacing: .08em;
-}
-
-.peer-ip {
-  font-size: .75rem;
-  color: var(--dim);
-  margin-bottom: 10px;
-}
-
-.peer-stats {
-  display: flex;
-  gap: 12px;
-  font-size: .75rem;
-}
-
-.peer-stat-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.peer-stat-item .val { color: var(--accent2); font-weight: 600; }
-
-.peer-latency {
-  position: absolute;
-  top: 10px; right: 10px;
-  width: 8px; height: 8px;
+.net-bubble {
+  position: relative;
+  width: 68px; height: 68px;
   border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 24px;
+  background:
+    radial-gradient(circle at 32% 28%, rgba(255,255,255,.12), transparent 55%),
+    var(--glass);
+  border: 1.5px solid var(--net-line);
+  box-shadow: 0 0 22px rgba(84,214,168,.18), inset 0 0 18px rgba(84,214,168,.06);
+  backdrop-filter: blur(6px);
+  transition: transform .2s var(--ease), box-shadow .2s var(--ease);
+}
+.net-node:hover .net-bubble { transform: scale(1.08); box-shadow: 0 0 30px rgba(84,214,168,.4); }
+
+.net-node.self .net-bubble {
+  width: 86px; height: 86px;
+  font-size: 30px;
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 34px rgba(84,214,168,.35), inset 0 0 22px rgba(84,214,168,.1);
 }
 
-.peer-latency.good { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
-.peer-latency.medium { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
-.peer-latency.bad { background: var(--bad); box-shadow: 0 0 6px var(--bad); }
-
-.peers-empty {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 20px;
-  color: var(--dim);
-  font-size: .85rem;
+.net-node.stale .net-bubble {
+  border-color: var(--bad);
+  box-shadow: 0 0 18px rgba(240,130,148,.25);
+  opacity: .75;
 }
 
-.peers-empty .scan-dots::after {
+.net-bubble .ring2 {
   content: '';
-  animation: scan-dots 1.5s steps(4) infinite;
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 100%; height: 100%;
+  border-radius: 50%;
+  border: 1px solid var(--accent-strong);
+  animation: ring-pulse 2.6s ease-out infinite;
+  pointer-events: none;
+}
+.net-node.stale .ring2 { display: none; }
+
+.net-label { text-align: center; line-height: 1.3; }
+.net-label .nm { font-size: .78rem; font-weight: 700; display: block; white-space: nowrap; }
+.net-label .nm .you {
+  font-size: .58rem; font-weight: 800;
+  color: var(--accent);
+  background: var(--accent-soft);
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  margin-left: 4px;
+  vertical-align: 1px;
+}
+.net-label .meta { font-size: .65rem; color: var(--dim); font-variant-numeric: tabular-nums; }
+
+.net-scanning {
+  position: absolute;
+  bottom: 14px; left: 50%;
+  transform: translateX(-50%);
+  font-size: .72rem; font-weight: 600;
+  color: var(--dim);
+  display: flex; align-items: center; gap: 8px;
+}
+.net-scanning .scan-ring {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-soft);
+  border-top-color: var(--accent-strong);
+  animation: spin 1s linear infinite;
 }
 
-/* ═══════════════════════════════════════════════════════════
-   WORKER CARDS GRID
-   ═══════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+   WORKER CARDS — progress ring + tags
+   ════════════════════════════════════════════════════════════ */
 .workers-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(305px, 1fr));
   gap: 14px;
 }
 
-.worker-card {
+.wcard {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 16px;
-  transition: all var(--transition);
-  position: relative;
-  overflow: hidden;
-}
-
-.worker-card:hover {
-  border-color: rgba(107,118,137,.5);
-  box-shadow: 0 2px 16px rgba(0,0,0,.3);
-}
-
-.worker-card.rendering {
-  border-color: rgba(57,255,139,.25);
-  animation: pulse-border 3s ease-in-out infinite;
-}
-
-.worker-card.offline {
-  opacity: .5;
-}
-
-.worker-top {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  margin-bottom: 10px;
-}
-
-.worker-name {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: .9rem;
-}
-
-.worker-gpu {
-  font-size: .75rem;
-  color: var(--accent2);
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  margin-top: 2px;
-}
-
-.status-badge {
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .65rem;
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 99px;
-  text-transform: uppercase;
-  letter-spacing: .08em;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  white-space: nowrap;
-}
-
-.status-badge .status-dot {
-  width: 6px; height: 6px;
-  border-radius: 50%;
-}
-
-.status-badge.rendering {
-  background: rgba(57,255,139,.12);
-  color: var(--accent);
-}
-.status-badge.rendering .status-dot {
-  background: var(--accent);
-  animation: pulse-dot 1.5s infinite;
-}
-
-.status-badge.idle {
-  background: rgba(31,209,255,.1);
-  color: var(--accent2);
-}
-.status-badge.idle .status-dot { background: var(--accent2); }
-
-.status-badge.offline {
-  background: rgba(255,92,108,.1);
-  color: var(--bad);
-}
-.status-badge.offline .status-dot { background: var(--bad); }
-
-.status-badge.queued {
-  background: rgba(167,139,250,.1);
-  color: var(--accent3);
-}
-.status-badge.queued .status-dot { background: var(--accent3); }
-
-.status-badge.done {
-  background: rgba(57,255,139,.1);
-  color: var(--accent);
-}
-.status-badge.done .status-dot { background: var(--accent); }
-
-.status-badge.failed {
-  background: rgba(255,92,108,.1);
-  color: var(--bad);
-}
-.status-badge.failed .status-dot { background: var(--bad); }
-
-.status-badge.cancelled {
-  background: rgba(107,118,137,.15);
-  color: var(--dim);
-}
-.status-badge.cancelled .status-dot { background: var(--dim); }
-
-.worker-render-info {
-  font-size: .75rem;
-  color: var(--dim);
-  margin: 8px 0;
-}
-
-.worker-render-info span { color: var(--accent); }
-
-/* Progress bar */
-.progress-bar-wrap {
-  height: 6px;
-  background: var(--panel3);
-  border-radius: 3px;
-  overflow: hidden;
-  margin: 8px 0;
-}
-
-.progress-bar-fill {
-  height: 100%;
-  border-radius: 3px;
-  background: linear-gradient(90deg, var(--accent2), var(--accent));
-  transition: width .6s cubic-bezier(.4,0,.2,1);
-  position: relative;
-}
-
-.progress-bar-fill.active {
-  animation: progress-glow 2s ease-in-out infinite;
-}
-
-.worker-footer {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
-}
-
-.worker-tag {
-  font-size: .65rem;
-  padding: 2px 7px;
-  border-radius: 4px;
-  background: var(--panel3);
-  color: var(--dim);
-}
-
-/* ═══════════════════════════════════════════════════════════
-   JOB CARDS
-   ═══════════════════════════════════════════════════════════ */
-.jobs-header-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.btn {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: .78rem;
-  letter-spacing: .04em;
-  padding: 8px 16px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--line);
-  background: var(--panel2);
-  color: var(--txt);
-  cursor: pointer;
-  transition: all var(--transition);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  white-space: nowrap;
-}
-
-.btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  box-shadow: 0 0 12px var(--glow-accent);
-}
-
-.btn.primary {
-  background: linear-gradient(135deg, rgba(57,255,139,.15), rgba(31,209,255,.1));
-  border-color: rgba(57,255,139,.4);
-  color: var(--accent);
-}
-
-.btn.primary:hover {
-  background: linear-gradient(135deg, rgba(57,255,139,.25), rgba(31,209,255,.15));
-  box-shadow: 0 0 20px var(--glow-accent);
-}
-
-.btn.danger {
-  border-color: rgba(255,92,108,.3);
-  color: var(--bad);
-}
-.btn.danger:hover {
-  border-color: var(--bad);
-  box-shadow: 0 0 12px rgba(255,92,108,.15);
-}
-
-.btn.small {
-  font-size: .68rem;
-  padding: 5px 10px;
-}
-
-.btn:disabled {
-  opacity: .4;
-  cursor: not-allowed;
-  pointer-events: none;
-}
-
-.jobs-list {
+  border-radius: var(--r-lg);
+  padding: 18px;
+  box-shadow: var(--shadow-soft);
   display: flex;
   flex-direction: column;
   gap: 12px;
+  transition: all .25s var(--ease);
 }
+.wcard:hover { transform: translateY(-2px); box-shadow: var(--shadow); }
+.wcard.offline { opacity: .55; }
+.wcard.rendering { border-color: rgba(84,214,168,.35); }
+
+.wcard-top { display: flex; align-items: center; gap: 13px; }
+
+.ring-wrap { position: relative; width: 52px; height: 52px; flex-shrink: 0; }
+.ring-wrap svg { transform: rotate(-90deg); }
+.ring-bg { fill: none; stroke: var(--panel-3); stroke-width: 4.5; }
+.ring-fg {
+  fill: none;
+  stroke: var(--accent-strong);
+  stroke-width: 4.5;
+  stroke-linecap: round;
+  transition: stroke-dashoffset .6s var(--ease);
+}
+.ring-pct {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: .68rem; font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+.ring-idle { color: var(--faint); font-size: 16px; }
+
+.wname { font-size: .92rem; font-weight: 700; letter-spacing: -.01em; }
+.wgpu { font-size: .73rem; color: var(--dim); margin-top: 2px; }
+
+.wcard-top .status-badge { margin-left: auto; align-self: flex-start; }
+
+.wtask { font-size: .76rem; color: var(--dim); }
+.wtask b { color: var(--txt); font-weight: 600; }
+
+.wtags { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.wtag {
+  font-size: .66rem; font-weight: 600;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  background: var(--panel-3);
+  color: var(--dim);
+}
+
+/* ════════════════════════════════════════════════════════════
+   STATUS BADGES
+   ════════════════════════════════════════════════════════════ */
+.status-badge {
+  font-size: .66rem;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  padding: 4px 11px;
+  border-radius: var(--r-pill);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.status-badge .status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.status-badge.rendering { background: var(--accent-soft); color: var(--accent); }
+.status-badge.rendering .status-dot { animation: pulse 1.4s infinite; }
+.status-badge.idle      { background: var(--blue-soft); color: var(--blue); }
+.status-badge.offline   { background: var(--bad-soft); color: var(--bad); }
+.status-badge.queued    { background: var(--violet-soft); color: var(--violet); }
+.status-badge.done      { background: var(--accent-soft); color: var(--accent); }
+.status-badge.failed    { background: var(--bad-soft); color: var(--bad); }
+.status-badge.cancelled { background: var(--panel-3); color: var(--dim); }
+.status-badge.paused    { background: var(--warn-soft); color: var(--warn); }
+
+/* ════════════════════════════════════════════════════════════
+   JOB CARDS
+   ════════════════════════════════════════════════════════════ */
+.jobs-list { display: flex; flex-direction: column; gap: 14px; }
 
 .job-card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-soft);
   overflow: hidden;
-  transition: all var(--transition);
+  transition: all .25s var(--ease);
 }
+.job-card:hover { box-shadow: var(--shadow); }
 
-.job-card:hover {
-  border-color: rgba(107,118,137,.4);
-}
-
-.job-card-main {
-  padding: 16px;
-}
+.job-card-main { padding: 20px 22px; }
 
 .job-top-row {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 13px;
   flex-wrap: wrap;
 }
 
-.job-name {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: 1rem;
-}
+.job-name { font-size: 1.05rem; font-weight: 700; letter-spacing: -.015em; }
+.job-blend-file { font-size: .72rem; color: var(--faint); }
 
-.job-blend-file {
-  font-size: .72rem;
-  color: var(--dim);
+.chip {
+  font-size: .66rem; font-weight: 700;
+  padding: 3.5px 10px;
+  border-radius: var(--r-pill);
 }
+.chip.frames { background: var(--blue-soft); color: var(--blue); font-variant-numeric: tabular-nums; }
+.chip.engine { background: var(--violet-soft); color: var(--violet); }
+.chip.device { background: var(--warn-soft); color: var(--warn); }
+.chip.samples { background: var(--panel-3); color: var(--dim); }
+.chip.prio-high { background: var(--bad-soft); color: var(--bad); }
+.chip.prio-low { background: var(--panel-3); color: var(--dim); }
 
-.badge {
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .6rem;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 4px;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-}
-
-.badge.frames {
-  background: rgba(31,209,255,.1);
-  color: var(--accent2);
-  border: 1px solid rgba(31,209,255,.2);
-}
-
-.badge.engine {
-  background: rgba(167,139,250,.1);
-  color: var(--accent3);
-  border: 1px solid rgba(167,139,250,.2);
-}
-
-.badge.device {
-  background: rgba(255,207,77,.08);
-  color: var(--warn);
-  border: 1px solid rgba(255,207,77,.2);
-}
-
-.badge.samples {
-  background: var(--panel3);
-  color: var(--dim);
-  border: 1px solid var(--line);
-}
-
-/* Segmented progress bar for jobs */
 .job-progress-bar {
-  height: 8px;
-  background: var(--panel3);
-  border-radius: 4px;
+  height: 9px;
+  background: var(--panel-3);
+  border-radius: var(--r-pill);
   overflow: hidden;
   display: flex;
-  margin: 10px 0;
+  margin: 12px 0;
 }
-
-.job-progress-seg {
-  height: 100%;
-  transition: width .6s cubic-bezier(.4,0,.2,1);
-}
-
-.job-progress-seg.done {
-  background: linear-gradient(90deg, var(--accent2), var(--accent));
-}
-
-.job-progress-seg.rendering-seg {
-  background: var(--warn);
-  animation: progress-glow 2s ease-in-out infinite;
-}
-
-.job-progress-seg.failed-seg {
-  background: var(--bad);
-}
+.job-progress-seg { height: 100%; transition: width .6s var(--ease); }
+.job-progress-seg.done { background: linear-gradient(90deg, var(--accent-strong), var(--accent)); }
+.job-progress-seg.rendering-seg { background: var(--warn); animation: pulse 2s ease-in-out infinite; }
+.job-progress-seg.failed-seg { background: var(--bad); }
 
 .job-stats-line {
   display: flex;
-  gap: 16px;
-  font-size: .75rem;
+  gap: 18px;
+  font-size: .76rem;
   color: var(--dim);
   flex-wrap: wrap;
+  font-variant-numeric: tabular-nums;
 }
-
-.job-stats-line .val { font-weight: 600; }
+.job-stats-line .val { font-weight: 700; color: var(--txt); }
 .job-stats-line .done-val { color: var(--accent); }
 .job-stats-line .rend-val { color: var(--warn); }
 .job-stats-line .fail-val { color: var(--bad); }
-.job-stats-line .eta-val { color: var(--accent2); }
+.job-stats-line .eta-val { color: var(--blue); }
+.job-stats-line .sub { font-size: .69rem; color: var(--faint); }
 
-.job-actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 12px;
-  flex-wrap: wrap;
-}
+.job-actions { display: flex; gap: 7px; margin-top: 15px; flex-wrap: wrap; }
 
-/* ═══════════════════════════════════════════════════════════
-   JOB DETAIL (EXPANDED)
-   ═══════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+   JOB DETAIL (expanded)
+   ════════════════════════════════════════════════════════════ */
 .job-detail {
   overflow: hidden;
   max-height: 0;
   opacity: 0;
-  transition: max-height .5s cubic-bezier(.4,0,.2,1), opacity .3s ease, padding .3s ease;
+  transition: max-height .5s var(--ease), opacity .3s ease, padding .3s ease;
   border-top: 1px solid var(--line);
-  padding: 0 16px;
-  background: var(--panel2);
+  padding: 0 22px;
+  background: var(--panel-2);
 }
-
-.job-detail.open {
-  max-height: 5000px;
-  opacity: 1;
-  padding: 16px;
-}
+.job-detail.open { max-height: 5000px; opacity: 1; padding: 20px 22px; }
 
 .detail-section-title {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: .8rem;
-  letter-spacing: .06em;
-  text-transform: uppercase;
+  font-size: .72rem; font-weight: 700;
+  letter-spacing: .06em; text-transform: uppercase;
   color: var(--dim);
-  margin: 16px 0 10px;
+  margin: 18px 0 10px;
 }
-
 .detail-section-title:first-child { margin-top: 0; }
 
-/* Frame Grid */
+.output-path {
+  font-size: .7rem; color: var(--dim);
+  padding: 8px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  margin-bottom: 6px;
+  word-break: break-all;
+  font-family: 'JetBrains Mono', monospace;
+}
+.output-path b { color: var(--accent); font-weight: 600; }
+
 .frame-grid-wrap {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  padding: 12px;
+  border-radius: var(--r-md);
+  padding: 13px;
   overflow-x: auto;
 }
-
-.frame-grid {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 3px;
-}
-
+.frame-grid { display: flex; flex-wrap: wrap; gap: 4px; }
 .frame-cell {
-  width: 18px; height: 18px;
-  border-radius: 2px;
+  width: 17px; height: 17px;
+  border-radius: 5px;
   cursor: pointer;
-  transition: transform .15s ease, box-shadow .15s ease;
-  position: relative;
+  transition: transform .15s ease;
 }
-
-.frame-cell:hover {
-  transform: scale(1.6);
-  z-index: 10;
-}
-
-.frame-cell.pending { background: var(--panel3); }
-.frame-cell.done { background: var(--accent); box-shadow: 0 0 3px rgba(57,255,139,.3); }
-.frame-cell.rendering-cell { background: var(--warn); animation: pulse-dot 1.5s infinite; }
+.frame-cell:hover { transform: scale(1.55); z-index: 5; position: relative; }
+.frame-cell.pending { background: var(--panel-3); }
+.frame-cell.done { background: var(--accent-strong); }
+.frame-cell.rendering-cell { background: var(--warn); animation: pulse 1.4s infinite; }
 .frame-cell.failed-cell { background: var(--bad); }
-.frame-cell.assigned { background: var(--warn); opacity: .7; }
-.frame-cell.cancelled-cell { background: var(--idle); opacity: .5; }
+.frame-cell.cancelled-cell { background: var(--faint); opacity: .45; }
 
-/* Recent-frames thumbnail strip */
-.recent-frames-strip {
-  display: flex; gap: 8px; flex-wrap: wrap;
-  padding: 10px;
-  background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--radius-sm); min-height: 70px; align-items: flex-start;
-}
-.recent-frame-thumb {
-  position: relative; cursor: pointer;
-  border-radius: 4px; overflow: hidden;
-  border: 1px solid var(--line);
-  transition: transform .15s, border-color .15s;
-  text-decoration: none;
-}
-.recent-frame-thumb:hover { transform: scale(1.05); border-color: var(--accent); }
-.recent-frame-thumb img {
-  display: block; width: 80px; height: 60px;
-  object-fit: cover; background: var(--panel2);
-}
-.recent-frame-thumb .thumb-label {
-  position: absolute; bottom: 0; left: 0; right: 0;
-  background: rgba(0,0,0,.7); color: var(--txt);
-  font-size: .55rem; text-align: center; padding: 2px 0;
-}
-
-/* Tooltip */
-.tooltip {
-  position: fixed;
-  z-index: 9999;
-  background: rgba(10,12,16,.95);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  padding: 8px 12px;
-  font-size: .72rem;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity .15s;
-  max-width: 240px;
-  backdrop-filter: blur(8px);
-  box-shadow: 0 8px 32px rgba(0,0,0,.5);
-}
-
-.tooltip.visible { opacity: 1; }
-
-.tooltip .tt-label { color: var(--dim); }
-.tooltip .tt-val { color: var(--txt); font-weight: 600; }
-
-/* Timeline */
 .timeline-bar-wrap {
-  height: 24px;
+  height: 26px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-sm);
   overflow: hidden;
   display: flex;
   position: relative;
 }
-
-.timeline-bar-wrap .tl-seg {
-  height: 100%;
-  transition: width .5s ease;
-}
-.timeline-bar-wrap .tl-seg.done { background: linear-gradient(90deg, var(--accent2), var(--accent)); }
-.timeline-bar-wrap .tl-seg.rendering-seg { background: var(--warn); opacity: .7; }
-.timeline-bar-wrap .tl-seg.failed-seg { background: var(--bad); opacity: .7; }
+.timeline-bar-wrap .tl-seg { height: 100%; transition: width .5s ease; }
+.timeline-bar-wrap .tl-seg.done { background: linear-gradient(90deg, var(--accent-strong), var(--accent)); }
+.timeline-bar-wrap .tl-seg.rendering-seg { background: var(--warn); opacity: .75; }
+.timeline-bar-wrap .tl-seg.failed-seg { background: var(--bad); opacity: .75; }
 .timeline-bar-wrap .tl-seg.pending { background: transparent; }
-
 .timeline-label {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .7rem;
-  color: rgba(255,255,255,.7);
-  text-shadow: 0 1px 4px rgba(0,0,0,.8);
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: .7rem; font-weight: 700;
+  color: var(--txt);
+  text-shadow: 0 1px 4px rgba(0,0,0,.4);
   pointer-events: none;
+  font-variant-numeric: tabular-nums;
 }
+[data-theme="light"] .timeline-label { text-shadow: 0 1px 4px rgba(255,255,255,.5); }
 
-/* Frame Table */
-.frame-table-wrap {
-  overflow-x: auto;
-  margin-top: 8px;
-}
-
-.frame-filter-row {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-.frame-filter-input {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: .75rem;
-  padding: 5px 10px;
+.recent-frames-strip {
+  display: flex; gap: 9px; flex-wrap: wrap;
+  padding: 11px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  color: var(--txt);
-  outline: none;
-  transition: border-color var(--transition);
-  width: 180px;
+  border-radius: var(--r-md);
+  min-height: 72px;
+  align-items: flex-start;
+}
+.recent-frame-thumb {
+  position: relative; cursor: pointer;
+  border-radius: 9px; overflow: hidden;
+  border: 1px solid var(--line);
+  transition: transform .15s, border-color .15s;
+  text-decoration: none;
+}
+.recent-frame-thumb:hover { transform: scale(1.06); border-color: var(--accent-strong); }
+.recent-frame-thumb img { display: block; width: 84px; height: 60px; object-fit: cover; background: var(--panel-3); }
+.recent-frame-thumb .thumb-label {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: rgba(0,0,0,.65); color: #fff;
+  font-size: .58rem; font-weight: 600; text-align: center; padding: 2px 0;
 }
 
-.frame-filter-input:focus { border-color: var(--accent2); }
-
-.frame-filter-select {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: .75rem;
-  padding: 5px 10px;
+/* Frame table */
+.frame-filter-row { display: flex; gap: 9px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+.frame-filter-input, .frame-filter-select {
+  font-family: 'Inter', sans-serif;
+  font-size: .77rem;
+  padding: 7px 13px;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: var(--r-pill);
   color: var(--txt);
   outline: none;
-  cursor: pointer;
+  transition: border-color .2s;
 }
+.frame-filter-input { width: 200px; }
+.frame-filter-input:focus, .frame-filter-select:focus { border-color: var(--accent-strong); }
+.frame-filter-select { cursor: pointer; }
 
-.frame-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: .72rem;
-}
-
+.frame-table-wrap { overflow-x: auto; }
+.frame-table { width: 100%; border-collapse: collapse; font-size: .76rem; font-variant-numeric: tabular-nums; }
 .frame-table th {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: .68rem;
-  text-transform: uppercase;
-  letter-spacing: .06em;
+  font-size: .66rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .05em;
   color: var(--dim);
-  padding: 8px 10px;
+  padding: 9px 11px;
   text-align: left;
   border-bottom: 1px solid var(--line);
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
 }
+.frame-table th:hover { color: var(--accent); }
+.frame-table td { padding: 7px 11px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.frame-table tr:hover td { background: var(--accent-soft); }
+.error-text { color: var(--bad); font-size: .69rem; max-width: 220px; word-break: break-word; }
 
-.frame-table th:hover { color: var(--accent2); }
+.no-jobs-msg { text-align: center; padding: 46px 20px; color: var(--dim); font-size: .85rem; }
+.no-jobs-msg .big-icon { font-size: 2.4rem; margin-bottom: 10px; opacity: .4; }
 
-.frame-table td {
-  padding: 6px 10px;
-  border-bottom: 1px solid rgba(34,42,56,.5);
-  vertical-align: top;
-}
-
-.frame-table tr:hover td { background: rgba(31,209,255,.03); }
-
-.error-text {
-  color: var(--bad);
-  font-size: .68rem;
-  max-width: 200px;
-  word-break: break-word;
-}
-
-/* ═══════════════════════════════════════════════════════════
-   MODAL
-   ═══════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+   MODALS
+   ════════════════════════════════════════════════════════════ */
 .modal-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 500;
-  background: rgba(0,0,0,.6);
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
+  position: fixed; inset: 0; z-index: 500;
+  background: rgba(5,7,9,.55);
+  backdrop-filter: blur(8px);
   display: none;
-  align-items: center;
-  justify-content: center;
+  align-items: center; justify-content: center;
   padding: 24px;
 }
-
+[data-theme="light"] .modal-overlay { background: rgba(30,40,50,.35); }
 .modal-overlay.open { display: flex; }
 
 .modal {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 14px;
+  border-radius: 22px;
   width: 100%;
-  max-width: 580px;
+  max-width: 600px;
   max-height: 90vh;
   overflow-y: auto;
-  box-shadow: 0 24px 80px rgba(0,0,0,.6), 0 0 60px var(--glow-accent);
-  animation: fade-in .3s ease;
-  position: relative;
-}
-
-.modal::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 3px;
-  background: linear-gradient(90deg, var(--accent), var(--accent2), var(--accent3));
-  border-radius: 14px 14px 0 0;
+  box-shadow: var(--shadow);
+  animation: fade-up .3s var(--ease);
 }
 
 .modal-header {
-  padding: 20px 24px 0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  padding: 22px 26px 0;
+  display: flex; align-items: center; justify-content: space-between;
 }
-
-.modal-title {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 700;
-  font-size: 1.1rem;
-  letter-spacing: .06em;
-}
-
+.modal-title { font-size: 1.12rem; font-weight: 800; letter-spacing: -.015em; }
 .modal-close {
-  width: 30px; height: 30px;
+  width: 32px; height: 32px;
   border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--panel2);
+  border-radius: 10px;
+  background: var(--panel-2);
   color: var(--dim);
   cursor: pointer;
-  font-size: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: all var(--transition);
+  font-size: 15px;
+  display: flex; align-items: center; justify-content: center;
+  transition: all .2s;
 }
+.modal-close:hover { color: var(--bad); border-color: var(--bad); }
 
-.modal-close:hover {
-  border-color: var(--bad);
-  color: var(--bad);
-}
+.modal-body { padding: 20px 26px 26px; }
 
-.modal-body {
-  padding: 20px 24px 24px;
-}
-
-.form-group {
-  margin-bottom: 16px;
-}
-
+.form-group { margin-bottom: 16px; }
 .form-label {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 500;
-  font-size: .75rem;
-  letter-spacing: .04em;
-  text-transform: uppercase;
+  font-size: .72rem; font-weight: 700;
+  letter-spacing: .03em; text-transform: uppercase;
   color: var(--dim);
-  margin-bottom: 6px;
+  margin-bottom: 7px;
   display: block;
 }
-
 .form-input, .form-select {
   width: 100%;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: .8rem;
-  padding: 9px 12px;
-  background: var(--panel2);
+  font-family: 'Inter', sans-serif;
+  font-size: .84rem;
+  padding: 10px 14px;
+  background: var(--panel-2);
   border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  border-radius: 12px;
   color: var(--txt);
   outline: none;
-  transition: border-color var(--transition);
+  transition: border-color .2s, box-shadow .2s;
 }
-
 .form-input:focus, .form-select:focus {
-  border-color: var(--accent2);
-  box-shadow: 0 0 0 2px rgba(31,209,255,.1);
+  border-color: var(--accent-strong);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
+.form-input::placeholder { color: var(--faint); }
+.form-hint { font-size: .69rem; color: var(--faint); margin-top: 5px; }
+.form-hint code { font-family: 'JetBrains Mono', monospace; font-size: .65rem; }
 
-.form-input::placeholder { color: var(--idle); }
+.form-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 11px; }
+.form-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 
-.form-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 10px;
-}
-
-.form-row-2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-
-.form-checkbox-wrap {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-}
-
-.form-checkbox-wrap input[type="checkbox"] {
-  width: 16px; height: 16px;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-
-.form-checkbox-label {
-  font-size: .78rem;
-  color: var(--txt);
-}
-
-.form-file-wrap {
-  position: relative;
-}
+.form-checkbox-wrap { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.form-checkbox-wrap input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent-strong); cursor: pointer; }
+.form-checkbox-label { font-size: .8rem; }
 
 .form-file-input {
   width: 100%;
-  font-family: 'JetBrains Mono', monospace;
-  font-size: .78rem;
-  padding: 9px 12px;
-  background: var(--panel2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
+  font-family: 'Inter', sans-serif;
+  font-size: .8rem;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  border: 1px dashed var(--line-strong);
+  border-radius: 12px;
   color: var(--txt);
   cursor: pointer;
 }
-
 .form-file-input::file-selector-button {
-  font-family: 'Chakra Petch', sans-serif;
-  font-weight: 600;
-  font-size: .7rem;
-  padding: 4px 12px;
-  margin-right: 10px;
-  border: 1px solid var(--accent2);
-  border-radius: 4px;
-  background: rgba(31,209,255,.1);
-  color: var(--accent2);
+  font-family: 'Inter', sans-serif;
+  font-weight: 700; font-size: .72rem;
+  padding: 5px 13px;
+  margin-right: 11px;
+  border: none;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
   cursor: pointer;
-  transition: all var(--transition);
 }
 
-.form-file-input::file-selector-button:hover {
-  background: rgba(31,209,255,.2);
-}
-
-.upload-progress {
-  margin-top: 6px;
-  display: none;
-}
-
+.upload-progress { margin-top: 8px; display: none; }
 .upload-progress.active { display: block; }
-
-.upload-progress .progress-bar-wrap { height: 4px; }
-
-.upload-progress-text {
-  font-size: .68rem;
-  color: var(--dim);
-  margin-top: 4px;
-}
-
-.detect-btn {
-  margin-top: 6px;
-}
+.upload-bar-wrap { height: 5px; background: var(--panel-3); border-radius: var(--r-pill); overflow: hidden; }
+.upload-bar-fill { height: 100%; border-radius: var(--r-pill); background: linear-gradient(90deg, var(--accent-strong), var(--accent)); transition: width .2s; }
+.upload-progress-text { font-size: .69rem; color: var(--dim); margin-top: 5px; font-variant-numeric: tabular-nums; }
 
 .detected-info {
-  margin-top: 8px;
-  padding: 10px;
-  background: rgba(57,255,139,.05);
-  border: 1px solid rgba(57,255,139,.15);
-  border-radius: var(--radius-sm);
-  font-size: .72rem;
+  margin-top: 9px;
+  padding: 10px 13px;
+  background: var(--accent-soft);
+  border: 1px solid transparent;
+  border-radius: 12px;
+  font-size: .74rem;
+  font-weight: 500;
   color: var(--accent);
   display: none;
 }
-
 .detected-info.visible { display: block; }
 
 .modal-footer {
-  display: flex;
-  gap: 10px;
-  justify-content: flex-end;
-  padding-top: 8px;
+  display: flex; gap: 10px; justify-content: flex-end;
+  padding-top: 14px;
   border-top: 1px solid var(--line);
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
-/* File/Path toggle */
-.file-path-toggle {
-  display: flex;
-  gap: 0;
-  margin-bottom: 10px;
-}
-
-.file-path-toggle .toggle-btn {
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .7rem;
-  font-weight: 600;
-  padding: 6px 14px;
-  border: 1px solid var(--line);
-  background: var(--panel2);
+.seg-toggle { display: inline-flex; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 3px; margin-bottom: 11px; }
+.seg-toggle .toggle-btn {
+  font-family: 'Inter', sans-serif;
+  font-size: .73rem; font-weight: 700;
+  padding: 6px 16px;
+  border: none; border-radius: var(--r-pill);
+  background: transparent;
   color: var(--dim);
   cursor: pointer;
-  transition: all var(--transition);
-  letter-spacing: .04em;
+  transition: all .2s;
 }
-
-.file-path-toggle .toggle-btn:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
-.file-path-toggle .toggle-btn:last-child { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
-
-.file-path-toggle .toggle-btn.active {
-  background: rgba(31,209,255,.1);
-  border-color: var(--accent2);
-  color: var(--accent2);
-}
+.seg-toggle .toggle-btn.active { background: var(--panel); color: var(--txt); box-shadow: var(--shadow-soft); }
 
 .form-group.hidden { display: none; }
 
-/* ═══════════════════════════════════════════════════════════
-   CONNECTION ERROR BANNER
-   ═══════════════════════════════════════════════════════════ */
+.info-box {
+  font-size: .76rem;
+  padding: 10px 13px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  word-break: break-all;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ════════════════════════════════════════════════════════════
+   TOOLTIP + ERROR BANNER
+   ════════════════════════════════════════════════════════════ */
+.tooltip {
+  position: fixed; z-index: 9999;
+  background: var(--glass);
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  padding: 9px 13px;
+  font-size: .73rem;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity .15s;
+  max-width: 250px;
+  backdrop-filter: blur(10px);
+  box-shadow: var(--shadow);
+}
+.tooltip.visible { opacity: 1; }
+.tooltip .tt-label { color: var(--dim); }
+.tooltip .tt-val { font-weight: 700; }
+
 .conn-error-banner {
   position: fixed;
-  bottom: 20px; left: 50%;
-  transform: translateX(-50%) translateY(80px);
+  bottom: 22px; left: 50%;
+  transform: translateX(-50%) translateY(90px);
   z-index: 999;
-  background: rgba(255,92,108,.1);
-  border: 1px solid rgba(255,92,108,.4);
+  background: var(--bad-soft);
+  border: 1px solid var(--bad);
   backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border-radius: var(--radius);
-  padding: 10px 20px;
-  font-family: 'Chakra Petch', sans-serif;
-  font-size: .8rem;
+  border-radius: var(--r-pill);
+  padding: 10px 22px;
+  font-size: .8rem; font-weight: 600;
   color: var(--bad);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  transition: transform .4s cubic-bezier(.4,0,.2,1);
-  box-shadow: 0 8px 32px rgba(255,92,108,.15);
+  display: flex; align-items: center; gap: 9px;
+  transition: transform .4s var(--ease);
 }
+.conn-error-banner.visible { transform: translateX(-50%) translateY(0); }
 
-.conn-error-banner.visible {
-  transform: translateX(-50%) translateY(0);
-}
-
-.no-jobs-msg {
-  text-align: center;
-  padding: 40px 20px;
-  color: var(--dim);
-  font-size: .85rem;
-}
-
-.no-jobs-msg .big-icon {
-  font-size: 2.5rem;
-  margin-bottom: 12px;
-  opacity: .4;
-}
-
-/* ═══════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
    RESPONSIVE
-   ═══════════════════════════════════════════════════════════ */
-@media (max-width: 768px) {
-  .header-inner { gap: 12px; }
-  .header-stats { gap: 12px; margin-left: 0; width: 100%; justify-content: space-around; }
-  .container { padding: 0 12px 40px; }
-  .workers-grid { grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
-  .peer-card { flex: 0 0 180px; }
+   ════════════════════════════════════════════════════════════ */
+@media (max-width: 900px) {
+  .rail { display: none; }
+  .main { padding: 18px 14px 60px; }
+  .topbar-stats { gap: 20px; margin-left: 0; width: 100%; }
   .form-row { grid-template-columns: 1fr 1fr; }
-  .modal { max-width: 100%; margin: 12px; }
 }
-
-@media (max-width: 480px) {
-  html { font-size: 13px; }
-  .header-inner { flex-direction: column; align-items: flex-start; }
+@media (max-width: 540px) {
+  html { font-size: 14px; }
   .workers-grid { grid-template-columns: 1fr; }
-  .form-row { grid-template-columns: 1fr; }
-  .form-row-2 { grid-template-columns: 1fr; }
-  .job-actions { flex-direction: column; }
-  .job-actions .btn { width: 100%; justify-content: center; }
+  .form-row, .form-row-2 { grid-template-columns: 1fr; }
+  .job-actions .btn { flex: 1; justify-content: center; }
+  .net-stage { height: 300px; }
 }
 </style>
 </head>
 <body>
 
-<!-- ═══════════════════════════════════════════════════════════
-     HEADER
-     ═══════════════════════════════════════════════════════════ -->
-<header>
-  <div class="header-inner">
-    <div class="hex-logo" aria-label="RenderHive Logo">
-      <div class="hex-outer"></div>
-      <div class="hex-inner"></div>
+<div class="shell">
+
+  <!-- ═══════════ ICON RAIL ═══════════ -->
+  <aside class="rail">
+    <div class="rail-logo" title="RenderHive">⬡</div>
+    <a class="rail-btn rail-tip active" href="#section-network" data-tip="Network">🌐</a>
+    <a class="rail-btn rail-tip" href="#section-nodes" data-tip="Render Nodes">⚡</a>
+    <a class="rail-btn rail-tip" href="#section-jobs" data-tip="Job Queue">🎬</a>
+    <div class="rail-spacer"></div>
+    <button class="rail-btn rail-tip" id="theme-toggle" data-tip="Theme" onclick="toggleTheme()">◐</button>
+    <button class="rail-btn rail-tip" data-tip="Settings" onclick="openSettingsModal()">⚙</button>
+  </aside>
+
+  <!-- ═══════════ MAIN ═══════════ -->
+  <div class="main">
+
+    <div class="topbar">
+      <h1>RenderHive</h1>
+      <div class="node-chip">
+        <span class="dot" id="conn-indicator"></span>
+        <span id="stat-node-addr">connecting…</span>
+      </div>
+      <div class="topbar-stats">
+        <div class="tstat"><span class="v" id="stat-gpus">—</span><span class="l">GPUs online</span></div>
+        <div class="tstat"><span class="v" id="stat-rendering">—</span><span class="l">Rendering</span></div>
+        <div class="tstat"><span class="v" id="stat-frames-done">—</span><span class="l">Frames done</span></div>
+        <div class="tstat"><span class="v" id="stat-speed">—</span><span class="l">Farm speed</span></div>
+      </div>
+      <button class="btn primary" id="btn-new-job" onclick="openSubmitModal()">＋ New Render Job</button>
     </div>
-    <div class="header-title">
-      <h1>RENDERHIVE</h1>
-      <span class="subtitle">PEER-TO-PEER GPU RENDER FARM</span>
-    </div>
-    <div class="header-stats">
-      <div class="header-stat">
-        <span class="stat-value" id="stat-gpus">—</span>
-        <span class="stat-label">GPUs Online</span>
+
+    <!-- ═══════════ NETWORK TOPOLOGY ═══════════ -->
+    <section id="section-network">
+      <div class="card fade-up">
+        <div class="card-head">
+          <h2>Farm Network</h2>
+          <span class="count-pill" id="peers-count">0 nodes</span>
+          <div class="head-actions">
+            <span style="font-size:.7rem;color:var(--faint)">live mesh · UDP discovery</span>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="net-stage" id="net-stage">
+            <svg class="net-svg" id="net-svg"></svg>
+            <div id="net-nodes"></div>
+            <div class="net-scanning" id="net-scanning"><span class="scan-ring"></span> scanning network…</div>
+          </div>
+        </div>
       </div>
-      <div class="header-stat">
-        <span class="stat-value" id="stat-rendering">—</span>
-        <span class="stat-label">Rendering</span>
+    </section>
+
+    <!-- ═══════════ RENDER NODES ═══════════ -->
+    <section id="section-nodes">
+      <div class="card fade-up">
+        <div class="card-head">
+          <h2>Render Nodes</h2>
+          <span class="count-pill" id="workers-count">0</span>
+        </div>
+        <div class="card-body">
+          <div class="workers-grid" id="workers-grid">
+            <div class="wcard"><div class="skeleton" style="height:110px"></div></div>
+            <div class="wcard"><div class="skeleton" style="height:110px"></div></div>
+            <div class="wcard"><div class="skeleton" style="height:110px"></div></div>
+          </div>
+        </div>
       </div>
-      <div class="header-stat">
-        <span class="stat-value" id="stat-frames-done">—</span>
-        <span class="stat-label">Frames Done</span>
+    </section>
+
+    <!-- ═══════════ JOB QUEUE ═══════════ -->
+    <section id="section-jobs">
+      <div class="card fade-up">
+        <div class="card-head">
+          <h2>Job Queue</h2>
+          <span class="count-pill" id="jobs-count">0</span>
+        </div>
+        <div class="card-body">
+          <div class="jobs-list" id="jobs-list">
+            <div class="no-jobs-msg" id="no-jobs-msg">
+              <div class="big-icon">🎞️</div>
+              <div>No render jobs yet</div>
+              <div style="font-size:.74rem;margin-top:5px">Click "＋ New Render Job" to submit your first render</div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="header-stat">
-        <span class="stat-value" id="stat-node-addr" style="font-size:.78rem;color:var(--accent2)">—</span>
-        <span class="stat-label">This Node</span>
-      </div>
-    </div>
-    <div class="connection-indicator" id="conn-indicator" title="API Connected"></div>
+    </section>
+
   </div>
-</header>
-
-<div class="container">
-
-  <!-- ═══════════════════════════════════════════════════════════
-       NETWORK PEERS
-       ═══════════════════════════════════════════════════════════ -->
-  <section id="section-peers">
-    <div class="section-header">
-      <div class="section-icon">🌐</div>
-      <h2>Network Peers</h2>
-      <span class="section-count" id="peers-count">0</span>
-    </div>
-    <div class="peers-scroll" id="peers-container">
-      <div class="peers-empty" id="peers-empty">
-        <span>Scanning network</span><span class="scan-dots"></span>
-      </div>
-    </div>
-  </section>
-
-  <!-- ═══════════════════════════════════════════════════════════
-       RENDER NODES (WORKERS)
-       ═══════════════════════════════════════════════════════════ -->
-  <section id="section-workers">
-    <div class="section-header">
-      <div class="section-icon">⚡</div>
-      <h2>Render Nodes</h2>
-      <span class="section-count" id="workers-count">0</span>
-    </div>
-    <div class="workers-grid" id="workers-grid">
-      <!-- Skeleton loaders -->
-      <div class="worker-card"><div class="skeleton" style="height:120px"></div></div>
-      <div class="worker-card"><div class="skeleton" style="height:120px"></div></div>
-      <div class="worker-card"><div class="skeleton" style="height:120px"></div></div>
-    </div>
-  </section>
-
-  <!-- ═══════════════════════════════════════════════════════════
-       JOB QUEUE
-       ═══════════════════════════════════════════════════════════ -->
-  <section id="section-jobs">
-    <div class="section-header">
-      <div class="section-icon">🎬</div>
-      <h2>Job Queue</h2>
-      <span class="section-count" id="jobs-count">0</span>
-      <div class="jobs-header-actions" style="margin-left:auto">
-        <button class="btn primary" id="btn-new-job" onclick="openSubmitModal()">+ New Render Job</button>
-      </div>
-    </div>
-    <div class="jobs-list" id="jobs-list">
-      <div class="no-jobs-msg" id="no-jobs-msg">
-        <div class="big-icon">🎞️</div>
-        <div>No render jobs yet</div>
-        <div style="font-size:.75rem;margin-top:4px">Click "+ New Render Job" to submit your first render</div>
-      </div>
-    </div>
-  </section>
-
 </div>
 
-<!-- ═══════════════════════════════════════════════════════════
-     SUBMIT MODAL
-     ═══════════════════════════════════════════════════════════ -->
+<!-- ═══════════ SUBMIT MODAL ═══════════ -->
 <div class="modal-overlay" id="submit-modal-overlay">
   <div class="modal" id="submit-modal">
     <div class="modal-header">
-      <span class="modal-title">⬡ New Render Job</span>
+      <span class="modal-title">New Render Job</span>
       <button class="modal-close" onclick="closeSubmitModal()" aria-label="Close">✕</button>
     </div>
     <div class="modal-body">
@@ -1406,19 +1058,19 @@ header {
 
       <div class="form-group">
         <label class="form-label">Blend Source</label>
-        <div class="file-path-toggle">
+        <div class="seg-toggle">
           <button class="toggle-btn active" id="toggle-file-btn" onclick="toggleBlendSource('file')">Upload File</button>
           <button class="toggle-btn" id="toggle-path-btn" onclick="toggleBlendSource('path')">Shared Path</button>
         </div>
         <div id="blend-file-group">
           <input class="form-file-input" type="file" id="blend-file-input" accept=".blend">
           <div class="upload-progress" id="upload-progress">
-            <div class="progress-bar-wrap"><div class="progress-bar-fill" id="upload-progress-bar" style="width:0%"></div></div>
+            <div class="upload-bar-wrap"><div class="upload-bar-fill" id="upload-progress-bar" style="width:0%"></div></div>
             <div class="upload-progress-text" id="upload-progress-text">Uploading...</div>
           </div>
         </div>
-        <div id="blend-path-group" class="form-group hidden" style="margin-top:10px;margin-bottom:0">
-          <input class="form-input" type="text" id="blend-path-input" placeholder="\\\\server\\share\\project\\scene.blend">
+        <div id="blend-path-group" class="form-group hidden" style="margin-bottom:0">
+          <input class="form-input" type="text" id="blend-path-input" placeholder="\\server\share\project\scene.blend">
         </div>
       </div>
 
@@ -1462,7 +1114,7 @@ header {
         </div>
       </div>
 
-      <div class="form-row-2">
+      <div class="form-row">
         <div class="form-group">
           <label class="form-label" for="samples-input">Samples Override</label>
           <input class="form-input" type="number" id="samples-input" placeholder="Auto" min="1">
@@ -1479,13 +1131,22 @@ header {
             <option value="WEBP">WEBP</option>
           </select>
         </div>
+        <div class="form-group">
+          <label class="form-label" for="priority-select">Priority</label>
+          <select class="form-select" id="priority-select">
+            <option value="2">Low</option>
+            <option value="5" selected>Normal</option>
+            <option value="8">High</option>
+            <option value="10">Urgent</option>
+          </select>
+        </div>
       </div>
 
       <div class="form-group">
-        <label class="form-label" for="output-dir-input">Output Directory <span style="color:var(--dim);font-weight:400">(optional)</span></label>
+        <label class="form-label" for="output-dir-input">Output Directory <span style="color:var(--faint);font-weight:500;text-transform:none">(optional)</span></label>
         <input class="form-input" type="text" id="output-dir-input"
-               placeholder="Default: farm_data/output/&lt;job-name&gt;">
-        <div style="font-size:.68rem;color:var(--dim);margin-top:3px">Absolute path or leave blank to use default location</div>
+               placeholder="Default: Documents\RenderHive\output\<job-name>">
+        <div class="form-hint" id="output-dir-hint">Absolute path, or leave blank to use the default location (configurable in ⚙ Settings)</div>
       </div>
 
       <div class="form-group">
@@ -1497,45 +1158,102 @@ header {
 
       <div class="modal-footer">
         <button class="btn" onclick="closeSubmitModal()">Cancel</button>
-        <button class="btn primary" id="submit-job-btn" onclick="submitJob()">⬡ Queue Job</button>
+        <button class="btn primary" id="submit-job-btn" onclick="submitJob()">Queue Job</button>
       </div>
     </div>
   </div>
 </div>
 
-<!-- Tooltip element -->
+<!-- ═══════════ SETTINGS MODAL ═══════════ -->
+<div class="modal-overlay" id="settings-modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">Settings</span>
+      <button class="modal-close" onclick="closeSettingsModal()" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label" for="default-output-dir-input">Default Output Directory</label>
+        <input class="form-input" type="text" id="default-output-dir-input"
+               placeholder="e.g. D:\Renders or \\server\renders">
+        <div class="form-hint">
+          New jobs save frames to <code>&lt;this folder&gt;\&lt;job-name&gt;</code>.
+          Leave blank to use the managed folder: <span id="managed-output-dir" style="color:var(--accent)">—</span>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Theme</label>
+        <div class="seg-toggle" style="margin-bottom:0">
+          <button class="toggle-btn" id="theme-btn-dark" onclick="setTheme('dark')">Dark</button>
+          <button class="toggle-btn" id="theme-btn-light" onclick="setTheme('light')">Light</button>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">User Data Location</label>
+        <div class="info-box" id="data-dir-display">—</div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeSettingsModal()">Cancel</button>
+        <button class="btn primary" id="save-settings-btn" onclick="saveSettings()">Save Settings</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Tooltip -->
 <div class="tooltip" id="global-tooltip"></div>
 
 <!-- Connection Error Banner -->
 <div class="conn-error-banner" id="conn-error-banner">
-  <span>⚠</span> <span>API unreachable — retrying...</span>
+  <span>⚠</span> <span>API unreachable — retrying…</span>
 </div>
 
 <script>
-/* ═══════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
    STATE & CONFIG
-   ═══════════════════════════════════════════════════════════ */
+   ════════════════════════════════════════════════════════════ */
 const STATE = {
   status: null,
-  expandedJobs: new Set(),       // job IDs currently expanded
-  jobDetails: {},                // job_id → detail data
+  expandedJobs: new Set(),
+  jobDetails: {},
   connected: false,
   firstLoad: true,
   pollTimer: null,
-  detailTimers: {},              // job_id → interval id
-  frameSortCol: {},              // job_id → { col, dir }
-  frameFilters: {},              // job_id → { search, status }
-  _prevHash: null,               // hash of last status JSON for change detection
-  _prevDetailHash: {},           // job_id → hash of last detail JSON
+  detailTimers: {},
+  frameSortCol: {},
+  frameFilters: {},
+  _prevHash: null,
+  _prevDetailHash: {},
 };
 
 const API_BASE = '';  // Same origin
 
-/* ═══════════════════════════════════════════════════════════
-   UTILITIES
-   ═══════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+   THEME
+   ════════════════════════════════════════════════════════════ */
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  try { localStorage.setItem('rh-theme', t); } catch (e) {}
+  syncThemeButtons();
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme');
+  setTheme(cur === 'light' ? 'dark' : 'light');
+}
+function syncThemeButtons() {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const d = document.getElementById('theme-btn-dark');
+  const l = document.getElementById('theme-btn-light');
+  if (d && l) {
+    d.classList.toggle('active', cur !== 'light');
+    l.classList.toggle('active', cur === 'light');
+  }
+}
+syncThemeButtons();
 
-/** Escape HTML to prevent XSS */
+/* ════════════════════════════════════════════════════════════
+   UTILITIES
+   ════════════════════════════════════════════════════════════ */
 function esc(str) {
   if (str == null) return '';
   const d = document.createElement('div');
@@ -1543,7 +1261,6 @@ function esc(str) {
   return d.innerHTML;
 }
 
-/** Format seconds to human readable */
 function fmtTime(secs) {
   if (secs == null || secs <= 0) return '—';
   if (secs < 60) return secs.toFixed(1) + 's';
@@ -1553,30 +1270,32 @@ function fmtTime(secs) {
   return h + 'h ' + m + 'm';
 }
 
-/** Format ETA */
 function fmtETA(secs) {
   if (secs == null || secs <= 0) return '—';
   return '~' + fmtTime(secs);
 }
 
-/** Format timestamp to time string */
-function fmtTimestamp(ts) {
-  if (!ts) return '—';
-  const d = new Date(ts * 1000);
-  return d.toLocaleTimeString();
+function fmtFinishAt(secs) {
+  if (secs == null || secs <= 0) return '';
+  const fin = new Date(Date.now() + secs * 1000);
+  const hm = fin.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const today = new Date();
+  if (fin.toDateString() === today.toDateString()) return hm;
+  const tomorrow = new Date(today.getTime() + 86400000);
+  if (fin.toDateString() === tomorrow.toDateString()) return 'tomorrow ' + hm;
+  return fin.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + hm;
 }
 
-/** Get status CSS class */
 function statusClass(status) {
   const map = {
     rendering: 'rendering', idle: 'idle', offline: 'offline',
     queued: 'queued', done: 'done', failed: 'failed', cancelled: 'cancelled',
-    assigned: 'rendering', pending: 'queued'
+    assigned: 'rendering', pending: 'queued', paused: 'paused'
   };
   return map[status] || 'idle';
 }
 
-/** Show/hide tooltip */
+/* Tooltip */
 const tooltipEl = document.getElementById('global-tooltip');
 function showTooltip(e, html) {
   tooltipEl.innerHTML = html;
@@ -1596,11 +1315,9 @@ function positionTooltip(e) {
   tooltipEl.style.top = y + 'px';
 }
 
-/* ═══════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
    API CALLS
-   ═══════════════════════════════════════════════════════════ */
-
-/** Simple fast hash for change detection (djb2) */
+   ════════════════════════════════════════════════════════════ */
 function fastHash(str) {
   let h = 5381;
   for (let i = 0; i < str.length; i++) {
@@ -1617,7 +1334,7 @@ async function fetchStatus() {
     setConnected(true);
     const hash = fastHash(text);
     if (hash === STATE._prevHash && !STATE.firstLoad) {
-      return; // No changes — skip re-render entirely
+      return;
     }
     STATE._prevHash = hash;
     const data = JSON.parse(text);
@@ -1635,9 +1352,7 @@ async function fetchJobDetail(jobId) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const text = await res.text();
     const hash = fastHash(text);
-    if (hash === STATE._prevDetailHash[jobId]) {
-      return; // No changes — skip re-render
-    }
+    if (hash === STATE._prevDetailHash[jobId]) return;
     STATE._prevDetailHash[jobId] = hash;
     const data = JSON.parse(text);
     STATE.jobDetails[jobId] = data;
@@ -1650,16 +1365,25 @@ async function fetchJobDetail(jobId) {
 async function postAction(url, body) {
   try {
     const opts = { method: 'POST' };
-    if (body) {
-      opts.body = body;
+    if (body != null) {
+      if (body instanceof FormData) {
+        opts.body = body;
+      } else {
+        opts.body = JSON.stringify(body);
+        opts.headers = { 'Content-Type': 'application/json' };
+      }
     }
     const res = await fetch(API_BASE + url, opts);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    // Re-fetch status immediately
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); if (j.error) msg = j.error; } catch (e) {}
+      throw new Error(msg);
+    }
     fetchStatus();
     return true;
   } catch (err) {
     console.error('Action failed:', err);
+    alert('Action failed: ' + err.message);
     return false;
   }
 }
@@ -1670,141 +1394,267 @@ function setConnected(ok) {
   const banner = document.getElementById('conn-error-banner');
   if (ok) {
     ind.classList.remove('error');
-    ind.title = 'API Connected';
     banner.classList.remove('visible');
   } else {
     ind.classList.add('error');
-    ind.title = 'API Disconnected';
     banner.classList.add('visible');
   }
 }
 
-/* ═══════════════════════════════════════════════════════════
-   RENDER FUNCTIONS
-   ═══════════════════════════════════════════════════════════ */
-
+/* ════════════════════════════════════════════════════════════
+   RENDER — top-level
+   ════════════════════════════════════════════════════════════ */
 function renderAll() {
   const s = STATE.status;
   if (!s) return;
-
   renderHeaderStats(s);
-  renderPeers(s);
+  renderNetwork(s);
   renderWorkers(s);
   renderJobs(s);
-  // After first render, disable fade-in animations on future updates
   if (STATE.firstLoad) {
     STATE.firstLoad = false;
-    // After animations complete, add a class that suppresses future fade-ins
     setTimeout(() => document.body.classList.add('loaded'), 600);
   }
 }
 
-/* --- Header Stats --- */
+/* --- Top stats --- */
 function renderHeaderStats(s) {
-  const totalGPUs = s.workers ? s.workers.filter(w => w.status !== 'offline').length : 0;
-  const renderingCount = s.workers ? s.workers.filter(w => w.status === 'rendering').length : 0;
-  const totalFramesDone = s.jobs ? s.jobs.reduce((sum, j) => sum + (j.done || 0), 0) : 0;
+  const workers = s.workers || [];
+  const online = workers.filter(w => w.status !== 'offline');
+  const renderingCount = workers.filter(w => w.status === 'rendering').length;
+  const totalFramesDone = (s.jobs || []).reduce((sum, j) => sum + (j.done || 0), 0);
+  // Farm speed: sum of 1/avg over online workers, shown in frames/min
+  const fps = online.reduce((acc, w) =>
+    w.avg_render_time > 0 ? acc + 1 / w.avg_render_time : acc, 0);
 
-  document.getElementById('stat-gpus').textContent = totalGPUs;
+  document.getElementById('stat-gpus').textContent = online.length;
   document.getElementById('stat-rendering').textContent = renderingCount;
   document.getElementById('stat-frames-done').textContent = totalFramesDone;
-  document.getElementById('stat-node-addr').textContent = esc(s.node_name || s.node_id || '—');
+  document.getElementById('stat-speed').innerHTML = fps > 0
+    ? (fps * 60).toFixed(1) + '<span class="unit">fr/min</span>'
+    : '—';
+  document.getElementById('stat-node-addr').textContent = s.node_name || s.node_id || '—';
 }
 
-/* --- Peers --- */
-function renderPeers(s) {
-  const container = document.getElementById('peers-container');
+/* ════════════════════════════════════════════════════════════
+   NETWORK TOPOLOGY — floating bubbles + animated mesh
+   ════════════════════════════════════════════════════════════ */
+const NET = {
+  nodes: [],          // [{id, el, bx, by, phase, isSelf, stale}]
+  signature: null,
+  raf: null,
+  packets: [],        // svg circles, one per self↔peer link
+};
+
+function renderNetwork(s) {
   const peers = s.peers || [];
-  const allPeers = [
-    { node_id: s.node_id, name: s.node_name || s.node_id, ip: 'localhost', port: location.port || 80, isSelf: true, last_seen_ago: 0, jobs_active: (s.jobs || []).filter(j=>j.status==='rendering').length, workers_active: (s.workers || []).filter(w=>w.status!=='offline').length },
-    ...peers
+  const selfJobs = (s.jobs || []).filter(j => j.status === 'rendering').length;
+  const selfWorkers = (s.workers || []).filter(w => w.status !== 'offline').length;
+
+  const all = [
+    { id: s.node_id || 'self', name: s.node_name || s.node_id || 'this PC',
+      ip: 'localhost', port: location.port || 80, isSelf: true,
+      workers: selfWorkers, jobs: selfJobs, stale: false },
+    ...peers.map(p => ({
+      id: p.node_id, name: p.name, ip: p.ip, port: p.port, isSelf: false,
+      workers: p.workers_active ?? 0, jobs: p.jobs_active ?? 0,
+      stale: (p.last_seen_ago ?? 0) > 20,
+    })),
   ];
 
-  document.getElementById('peers-count').textContent = allPeers.length;
+  document.getElementById('peers-count').textContent =
+    all.length + (all.length === 1 ? ' node' : ' nodes');
+  document.getElementById('net-scanning').style.display = peers.length ? 'none' : 'flex';
 
-  if (allPeers.length <= 1 && peers.length === 0) {
-    container.innerHTML = `<div class="peer-card self-peer" style="cursor:default">
-        <div class="peer-latency good"></div>
-        <div class="peer-name">${esc(s.node_name || s.node_id)} <span class="self-badge">YOU</span></div>
-        <div class="peer-ip">localhost</div>
-        <div class="peer-stats"><span style="color:var(--dim);font-size:.72rem">No other peers discovered yet</span></div>
-      </div>
-      <div class="peers-empty"><span>Scanning network</span><span class="scan-dots"></span></div>`;
-    return;
-  }
-
-  container.innerHTML = allPeers.map(p => {
-    const isSelf = p.isSelf;
-    const href = isSelf ? '#' : `http://${esc(p.ip)}:${esc(p.port)}`;
-    const target = isSelf ? '' : 'target="_blank" rel="noopener"';
-    const latency = p.last_seen_ago != null ? (p.last_seen_ago < 10 ? 'good' : p.last_seen_ago < 30 ? 'medium' : 'bad') : 'bad';
-    return `<a class="peer-card ${isSelf ? 'self-peer' : ''} fade-in" href="${href}" ${target} style="animation-delay:${Math.random()*.2}s">
-      <div class="peer-latency ${isSelf ? 'good' : latency}"></div>
-      <div class="peer-name">${esc(p.name)}${isSelf ? ' <span class="self-badge">YOU</span>' : ''}</div>
-      <div class="peer-ip">${isSelf ? 'localhost' : esc(p.ip) + ':' + esc(p.port)}</div>
-      <div class="peer-stats">
-        <div class="peer-stat-item">🎬 <span class="val">${p.jobs_active ?? 0}</span> jobs</div>
-        <div class="peer-stat-item">⚡ <span class="val">${p.workers_active ?? 0}</span> GPUs</div>
-      </div>
-    </a>`;
-  }).join('');
+  // Rebuild DOM only when the node set / key stats change
+  const sig = all.map(n => [n.id, n.name, n.workers, n.jobs, n.stale].join('|')).join('§');
+  if (sig === NET.signature) return;
+  NET.signature = sig;
+  buildTopology(all);
 }
 
-/* --- Workers --- */
+function buildTopology(all) {
+  const stage = document.getElementById('net-stage');
+  const nodesEl = document.getElementById('net-nodes');
+  const svg = document.getElementById('net-svg');
+  nodesEl.innerHTML = '';
+  svg.innerHTML = '';
+  NET.nodes = [];
+  NET.packets = [];
+
+  const W = stage.clientWidth || 800;
+  const H = stage.clientHeight || 340;
+  const cx = W / 2, cy = H / 2 - 8;
+  const peerN = all.length - 1;
+  const rx = Math.min(W * 0.36, 330);
+  const ry = Math.min(H * 0.30, 105);
+
+  // SVG lines first (under the bubbles): faint full mesh + bright self links
+  const ns = 'http://www.w3.org/2000/svg';
+  const positions = all.map((n, i) => {
+    if (n.isSelf) return { x: cx, y: cy };
+    const ang = (2 * Math.PI * (i - 1)) / Math.max(1, peerN) - Math.PI / 2;
+    return { x: cx + rx * Math.cos(ang), y: cy + ry * Math.sin(ang) };
+  });
+
+  for (let i = 0; i < all.length; i++) {
+    for (let j = i + 1; j < all.length; j++) {
+      const line = document.createElementNS(ns, 'line');
+      const isSelfLink = all[i].isSelf || all[j].isSelf;
+      line.setAttribute('class', isSelfLink ? 'link' : 'mesh');
+      svg.appendChild(line);
+      // Packet dot travelling along self links
+      let packet = null;
+      if (isSelfLink && !all[i].stale && !all[j].stale) {
+        packet = document.createElementNS(ns, 'circle');
+        packet.setAttribute('class', 'packet');
+        packet.setAttribute('r', '2.5');
+        svg.appendChild(packet);
+      }
+      NET.packets.push({ line, packet, a: i, b: j, t0: Math.random() });
+    }
+  }
+
+  all.forEach((n, i) => {
+    const a = document.createElement('a');
+    a.className = 'net-node' + (n.isSelf ? ' self' : '') + (n.stale ? ' stale' : '');
+    if (!n.isSelf) {
+      a.href = 'http://' + n.ip + ':' + n.port;
+      a.target = '_blank';
+      a.rel = 'noopener';
+    }
+    a.innerHTML =
+      '<div class="net-bubble">' + (n.isSelf ? '⬡' : '🖥️') + '<span class="ring2"></span></div>' +
+      '<div class="net-label">' +
+        '<span class="nm">' + esc(n.name) + (n.isSelf ? '<span class="you">YOU</span>' : '') + '</span>' +
+        '<span class="meta">' + (n.isSelf ? 'localhost' : esc(n.ip)) +
+          ' · ⚡' + n.workers + ' · 🎬' + n.jobs + '</span>' +
+      '</div>';
+    nodesEl.appendChild(a);
+    NET.nodes.push({
+      id: n.id, el: a, isSelf: n.isSelf, stale: n.stale,
+      bx: positions[i].x, by: positions[i].y,
+      phase: Math.random() * Math.PI * 2,
+      speed: 0.4 + Math.random() * 0.35,
+      ampx: n.isSelf ? 4 : 7 + Math.random() * 6,
+      ampy: n.isSelf ? 3 : 5 + Math.random() * 5,
+      x: positions[i].x, y: positions[i].y,
+    });
+  });
+
+  if (!NET.raf) netTick();
+}
+
+function netTick() {
+  NET.raf = requestAnimationFrame(netTick);
+  if (document.hidden || !NET.nodes.length) return;
+  const t = performance.now() / 1000;
+
+  // Drift the bubbles
+  for (const n of NET.nodes) {
+    n.x = n.bx + Math.sin(t * n.speed + n.phase) * n.ampx;
+    n.y = n.by + Math.cos(t * n.speed * 0.85 + n.phase * 1.6) * n.ampy;
+    // Bubble visual center sits ~34px (self ~43px) below node top; offset so
+    // the line endpoints meet the bubble centers.
+    const half = n.isSelf ? 43 : 34;
+    n.el.style.transform = 'translate(' + n.x + 'px,' + (n.y - half) + 'px)';
+  }
+
+  // Update mesh lines + packets
+  for (const p of NET.packets) {
+    const A = NET.nodes[p.a], B = NET.nodes[p.b];
+    if (!A || !B) continue;
+    p.line.setAttribute('x1', A.x); p.line.setAttribute('y1', A.y);
+    p.line.setAttribute('x2', B.x); p.line.setAttribute('y2', B.y);
+    if (p.packet) {
+      const k = ((t / 4) + p.t0) % 1;
+      p.packet.setAttribute('cx', A.x + (B.x - A.x) * k);
+      p.packet.setAttribute('cy', A.y + (B.y - A.y) * k);
+    }
+  }
+}
+
+window.addEventListener('resize', () => {
+  NET.signature = null;          // force topology rebuild on next poll
+  if (STATE.status) renderNetwork(STATE.status);
+});
+
+/* ════════════════════════════════════════════════════════════
+   RENDER NODES (WORKERS)
+   ════════════════════════════════════════════════════════════ */
+function progressRing(pct) {
+  const C = 2 * Math.PI * 21;
+  const off = C * (1 - Math.min(100, Math.max(0, pct)) / 100);
+  return '<div class="ring-wrap">' +
+    '<svg width="52" height="52" viewBox="0 0 52 52">' +
+      '<circle class="ring-bg" cx="26" cy="26" r="21"></circle>' +
+      '<circle class="ring-fg" cx="26" cy="26" r="21" stroke-dasharray="' + C.toFixed(1) +
+        '" stroke-dashoffset="' + off.toFixed(1) + '"></circle>' +
+    '</svg>' +
+    '<div class="ring-pct">' + Math.round(pct) + '%</div>' +
+  '</div>';
+}
+
 function renderWorkers(s) {
   const grid = document.getElementById('workers-grid');
   const workers = (s.workers || []).slice().sort((a, b) => {
-    const order = { rendering: 0, idle: 1, offline: 2 };
+    const order = { rendering: 0, idle: 1, paused: 2, offline: 3 };
     return (order[a.status] ?? 1) - (order[b.status] ?? 1);
   });
 
   document.getElementById('workers-count').textContent = workers.length;
 
   if (workers.length === 0) {
-    grid.innerHTML = `<div style="grid-column:1/-1;text-align:center;padding:30px;color:var(--dim)">
-      <div style="font-size:2rem;opacity:.4;margin-bottom:8px">⚡</div>
-      No render nodes registered yet</div>`;
+    grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:34px;color:var(--dim)">' +
+      '<div style="font-size:2rem;opacity:.4;margin-bottom:8px">⚡</div>' +
+      'No render nodes registered yet</div>';
     return;
   }
 
   grid.innerHTML = workers.map(w => {
     const st = w.status || 'idle';
     const isRendering = st === 'rendering';
-    const progressPct = w.progress || 0;
+    const isOffline = st === 'offline';
+    const pct = w.progress || 0;
 
-    return `<div class="worker-card ${st} fade-in">
-      <div class="worker-top">
-        <div>
-          <div class="worker-name">${esc(w.name || w.id)}</div>
-          <div class="worker-gpu">🖥 ${esc(w.gpu_name || 'Unknown GPU')}</div>
-        </div>
-        <div class="status-badge ${statusClass(st)}">
-          <span class="status-dot"></span>
-          ${esc(st)}
-        </div>
-      </div>
-      ${isRendering ? `
-        <div class="worker-render-info">
-          Rendering frame <span>${esc(w.current_frame)}</span> of <span>${esc(w.current_job_name || w.current_job)}</span>
-        </div>
-        <div class="progress-bar-wrap">
-          <div class="progress-bar-fill active" style="width:${progressPct}%"></div>
-        </div>
-        <div style="font-size:.7rem;color:var(--dim);text-align:right">${progressPct}%</div>
-      ` : `
-        <div class="worker-render-info" style="color:var(--idle)">Waiting for work…</div>
-      `}
-      <div class="worker-footer">
-        <span class="worker-tag">${esc(w.os || '—')}</span>
-        <span class="worker-tag">${esc(w.blender_version || '—')}</span>
-        <span class="worker-tag">✓ ${w.frames_done ?? 0} frames</span>
-        <span class="worker-tag">⏱ avg ${fmtTime(w.avg_render_time)}</span>
-      </div>
-    </div>`;
+    const ring = isRendering
+      ? progressRing(pct)
+      : '<div class="ring-wrap" style="display:flex;align-items:center;justify-content:center">' +
+          '<span class="ring-idle">' + (st === 'paused' ? '⏸' : isOffline ? '✕' : '◌') + '</span></div>';
+
+    const task = isRendering
+      ? '<div class="wtask">Frame <b>' + esc(w.current_frame) + '</b> of <b>' +
+          esc(w.current_job_name || w.current_job) + '</b>' +
+          (w.paused ? ' <span style="color:var(--warn)">(pausing after this frame)</span>' : '') + '</div>'
+      : '<div class="wtask" style="color:var(--faint)">' +
+          (st === 'paused' ? 'Paused — not accepting work' : isOffline ? 'Last seen ' + fmtTime(w.last_seen_ago) + ' ago' : 'Waiting for work…') +
+        '</div>';
+
+    return '<div class="wcard ' + st + ' fade-up">' +
+      '<div class="wcard-top">' +
+        ring +
+        '<div><div class="wname">' + esc(w.name || w.id) + '</div>' +
+        '<div class="wgpu">' + esc(w.gpu_name || 'Unknown GPU') + '</div></div>' +
+        '<div class="status-badge ' + statusClass(st) + '"><span class="status-dot"></span>' + esc(st) + '</div>' +
+      '</div>' +
+      task +
+      '<div class="wtags">' +
+        '<span class="wtag">' + esc(w.os || '—') + '</span>' +
+        '<span class="wtag">' + esc(w.blender_version || '—') + '</span>' +
+        '<span class="wtag">✓ ' + (w.frames_done ?? 0) + ' frames</span>' +
+        '<span class="wtag">⏱ avg ' + fmtTime(w.avg_render_time) + '</span>' +
+        (!isOffline
+          ? '<button class="btn small" style="margin-left:auto" onclick="pauseWorker(\'' + esc(w.id) + '\', ' + (w.paused ? 'false' : 'true') + ')">' +
+              (w.paused ? '▶ Resume' : '⏸ Pause') + '</button>'
+          : '') +
+      '</div>' +
+    '</div>';
   }).join('');
 }
 
-/* --- Jobs --- */
+/* ════════════════════════════════════════════════════════════
+   JOBS
+   ════════════════════════════════════════════════════════════ */
 function renderJobs(s) {
   const list = document.getElementById('jobs-list');
   const jobs = s.jobs || [];
@@ -1817,7 +1667,7 @@ function renderJobs(s) {
     return;
   }
 
-  // Save expanded detail content — prevents "Loading..." flash during every re-render
+  // Preserve expanded detail content to avoid "Loading..." flash
   const savedDetails = {};
   STATE.expandedJobs.forEach(jid => {
     const el = document.getElementById('job-detail-content-' + jid);
@@ -1826,14 +1676,13 @@ function renderJobs(s) {
 
   list.innerHTML = jobs.map(j => renderJobCard(j)).join('');
 
-  // Re-attach expanded state, restoring saved content while fresh data loads
   STATE.expandedJobs.forEach(jid => {
     const detailEl = document.getElementById('job-detail-' + jid);
     if (detailEl) {
       detailEl.classList.add('open');
       const contentEl = document.getElementById('job-detail-content-' + jid);
       if (contentEl && savedDetails[jid]) {
-        contentEl.innerHTML = savedDetails[jid];  // show last-known content instantly
+        contentEl.innerHTML = savedDetails[jid];
       }
       fetchJobDetail(jid);
     }
@@ -1848,12 +1697,19 @@ function renderJobCard(j) {
   const isExpanded = STATE.expandedJobs.has(j.id);
   const frameRange = `${j.frame_start ?? '?'}–${j.frame_end ?? '?'} /${j.frame_step ?? 1}`;
 
-  const canCancel = j.status === 'rendering' || j.status === 'queued';
+  const canCancel = ['rendering', 'queued', 'paused'].includes(j.status);
   const canDelete = j.status !== 'rendering';
   const canRetry = (j.failed || 0) > 0;
   const canZip = (j.done || 0) > 0;
+  const canPause = j.status === 'rendering' || j.status === 'queued';
+  const canResume = j.status === 'paused';
+  const prio = j.priority ?? 5;
+  const prioBadge = prio > 5
+    ? `<span class="chip prio-high">P${prio} ${prio >= 10 ? 'URGENT' : 'HIGH'}</span>`
+    : prio < 5 ? `<span class="chip prio-low">P${prio} LOW</span>` : '';
+  const finishAt = fmtFinishAt(j.eta_seconds);
 
-  return `<div class="job-card fade-in" id="job-card-${esc(j.id)}">
+  return `<div class="job-card fade-up" id="job-card-${esc(j.id)}">
     <div class="job-card-main">
       <div class="job-top-row">
         <span class="job-name">${esc(j.name || j.id)}</span>
@@ -1862,10 +1718,11 @@ function renderJobCard(j) {
           <span class="status-dot"></span>
           ${esc(j.status)}
         </div>
-        <span class="badge frames">${esc(frameRange)}</span>
-        ${j.engine ? `<span class="badge engine">${esc(j.engine)}</span>` : ''}
-        ${j.device ? `<span class="badge device">${esc(j.device)}</span>` : ''}
-        ${j.samples ? `<span class="badge samples">${esc(j.samples)} spp</span>` : ''}
+        ${prioBadge}
+        <span class="chip frames">${esc(frameRange)}</span>
+        ${j.engine ? `<span class="chip engine">${esc(j.engine)}</span>` : ''}
+        ${j.device ? `<span class="chip device">${esc(j.device)}</span>` : ''}
+        ${j.samples ? `<span class="chip samples">${esc(j.samples)} spp</span>` : ''}
       </div>
 
       <div class="job-progress-bar">
@@ -1878,13 +1735,17 @@ function renderJobCard(j) {
         <span><span class="val done-val">${j.done || 0}</span>/${total} done</span>
         <span><span class="val rend-val">${j.rendering || 0}</span> rendering</span>
         <span><span class="val fail-val">${j.failed || 0}</span> failed</span>
-        <span>ETA <span class="val eta-val">${fmtETA(j.eta_seconds)}</span>${j.eta_confidence != null ? ` <span style="color:var(--dim);font-size:.7rem">(${j.eta_confidence}%)</span>` : ''}</span>
-        ${j.farm_fps ? `<span style="color:var(--dim);font-size:.75rem">${(j.farm_fps*60).toFixed(2)} fpm</span>` : ''}
+        <span>ETA <span class="val eta-val">${fmtETA(j.eta_seconds)}</span>${finishAt ? ` <span class="sub">→ done ${finishAt}</span>` : ''}${j.eta_confidence != null ? ` <span class="sub">(±${100 - j.eta_confidence}%)</span>` : ''}</span>
+        ${j.eta_queued_behind ? `<span class="sub">incl. ${fmtTime(j.eta_queued_behind)} queue wait</span>` : ''}
+        ${j.elapsed_seconds ? `<span>elapsed <span class="val">${fmtTime(j.elapsed_seconds)}</span></span>` : ''}
+        ${j.farm_fps ? `<span class="sub">${(j.farm_fps*60).toFixed(2)} fr/min</span>` : ''}
         ${j.avg_render_time ? `<span>avg <span class="val">${fmtTime(j.avg_render_time)}</span>/frame</span>` : ''}
       </div>
 
       <div class="job-actions">
         <button class="btn small" onclick="toggleJobDetail('${esc(j.id)}')">${isExpanded ? '▾ Collapse' : '▸ Details'}</button>
+        ${canPause ? `<button class="btn small" onclick="pauseJob('${esc(j.id)}')">⏸ Pause</button>` : ''}
+        ${canResume ? `<button class="btn small" onclick="resumeJob('${esc(j.id)}')">▶ Resume</button>` : ''}
         ${canZip ? `<button class="btn small" onclick="downloadZip('${esc(j.id)}')">📦 Download .zip</button>` : ''}
         ${canRetry ? `<button class="btn small" onclick="retryFailed('${esc(j.id)}')">🔄 Retry Failed</button>` : ''}
         ${canCancel ? `<button class="btn small danger" onclick="cancelJob('${esc(j.id)}')">✕ Cancel</button>` : ''}
@@ -1904,7 +1765,6 @@ function renderJobCard(j) {
 function renderJobDetail(jobId) {
   const detail = STATE.jobDetails[jobId];
   if (!detail) return;
-
   const container = document.getElementById('job-detail-content-' + jobId);
   if (!container) return;
 
@@ -1915,7 +1775,6 @@ function renderJobDetail(jobId) {
   const rendCount = frames.filter(f => f.status === 'assigned' || f.status === 'rendering').length;
   const failCount = frames.filter(f => f.status === 'failed').length;
 
-  // Initialize filter/sort state if not set
   if (!STATE.frameSortCol[jobId]) STATE.frameSortCol[jobId] = { col: 'frame', dir: 1 };
   if (!STATE.frameFilters[jobId]) STATE.frameFilters[jobId] = { search: '', status: '' };
 
@@ -1925,9 +1784,7 @@ function renderJobDetail(jobId) {
 
   const outputDir = summary.output_dir || '';
   container.innerHTML = `
-    ${outputDir ? `<div style="font-size:.68rem;color:var(--dim);padding:6px 8px;background:var(--panel2);border-radius:var(--radius-sm);margin-bottom:8px;word-break:break-all">
-      <span style="color:var(--accent2)">📁 Output:</span> ${esc(outputDir)}
-    </div>` : ''}
+    ${outputDir ? `<div class="output-path"><b>📁 Output</b> ${esc(outputDir)}</div>` : ''}
     <div class="detail-section-title">Frame Grid</div>
     <div class="frame-grid-wrap">
       <div class="frame-grid" id="frame-grid-${esc(jobId)}">
@@ -1959,7 +1816,7 @@ function renderJobDetail(jobId) {
     <div class="recent-frames-strip">
       ${(() => {
         const done = frames.filter(f => f.status === 'done').sort((a,b) => b.frame - a.frame).slice(0, 8);
-        if (!done.length) return '<span style="color:var(--dim);font-size:.75rem;padding:4px">No completed frames yet</span>';
+        if (!done.length) return '<span style="color:var(--faint);font-size:.75rem;padding:4px">No completed frames yet</span>';
         return done.map(f =>
           `<a class="recent-frame-thumb" href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image" download>
             <img src="/api/jobs/${esc(jobId)}/frames/${f.frame}/image"
@@ -1973,7 +1830,7 @@ function renderJobDetail(jobId) {
 
     <div class="detail-section-title">Frame Table</div>
     <div class="frame-filter-row">
-      <input class="frame-filter-input" type="text" placeholder="Search frame # or worker..."
+      <input class="frame-filter-input" type="text" placeholder="Search frame # or worker…"
         id="frame-search-${esc(jobId)}"
         value="${esc(STATE.frameFilters[jobId].search)}"
         oninput="updateFrameFilter('${esc(jobId)}')">
@@ -1995,7 +1852,6 @@ function renderFrameTable(jobId, frames) {
   const sort = STATE.frameSortCol[jobId] || { col: 'frame', dir: 1 };
   const filter = STATE.frameFilters[jobId] || { search: '', status: '' };
 
-  // Filter
   let filtered = frames.filter(f => {
     if (filter.status && f.status !== filter.status) return false;
     if (filter.search) {
@@ -2005,7 +1861,6 @@ function renderFrameTable(jobId, frames) {
     return true;
   });
 
-  // Sort
   filtered.sort((a, b) => {
     let av = a[sort.col], bv = b[sort.col];
     if (av == null) av = '';
@@ -2025,20 +1880,22 @@ function renderFrameTable(jobId, frames) {
       <th onclick="sortFrameTable('${esc(jobId)}','progress')">Progress${sort.col === 'progress' ? arrow : ''}</th>
       <th onclick="sortFrameTable('${esc(jobId)}','attempts')">Tries${sort.col === 'attempts' ? arrow : ''}</th>
       <th>Error</th>
+      <th></th>
     </tr></thead>
     <tbody>
     ${filtered.slice(0, 200).map(f => `<tr>
       <td style="font-weight:600">${f.status === 'done'
         ? `<a href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image" download style="color:var(--accent);text-decoration:none">${f.frame} ⬇</a>`
         : f.frame}</td>
-      <td><span class="status-badge ${statusClass(f.status)} small" style="font-size:.6rem;padding:2px 6px"><span class="status-dot"></span>${esc(f.status)}</span></td>
+      <td><span class="status-badge ${statusClass(f.status)}" style="font-size:.58rem;padding:2px 8px"><span class="status-dot"></span>${esc(f.status)}</span></td>
       <td>${esc(f.worker || '—')}</td>
       <td>${fmtTime(f.render_time)}</td>
       <td>${f.progress != null ? f.progress + '%' : '—'}</td>
       <td>${f.attempts ?? 0}</td>
       <td>${f.last_error ? `<span class="error-text">${esc(f.last_error)}</span>` : '—'}</td>
+      <td>${['failed', 'assigned', 'cancelled'].includes(f.status) ? `<button class="btn small icon" title="Requeue this frame" onclick="requeueFrame('${esc(jobId)}', ${f.frame})">↻</button>` : ''}</td>
     </tr>`).join('')}
-    ${filtered.length > 200 ? `<tr><td colspan="7" style="text-align:center;color:var(--dim);padding:12px">Showing 200 of ${filtered.length} frames</td></tr>` : ''}
+    ${filtered.length > 200 ? `<tr><td colspan="8" style="text-align:center;color:var(--dim);padding:12px">Showing 200 of ${filtered.length} frames</td></tr>` : ''}
     </tbody>
   </table>`;
 }
@@ -2059,10 +1916,9 @@ function showFrameTooltip(e, jobId, frameNum) {
   showTooltip(e, html);
 }
 
-/* ═══════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
    INTERACTIONS
-   ═══════════════════════════════════════════════════════════ */
-
+   ════════════════════════════════════════════════════════════ */
 function toggleJobDetail(jobId) {
   const detailEl = document.getElementById('job-detail-' + jobId);
   if (!detailEl) return;
@@ -2070,7 +1926,6 @@ function toggleJobDetail(jobId) {
   if (STATE.expandedJobs.has(jobId)) {
     STATE.expandedJobs.delete(jobId);
     detailEl.classList.remove('open');
-    // Stop polling detail
     if (STATE.detailTimers[jobId]) {
       clearInterval(STATE.detailTimers[jobId]);
       delete STATE.detailTimers[jobId];
@@ -2078,26 +1933,17 @@ function toggleJobDetail(jobId) {
   } else {
     STATE.expandedJobs.add(jobId);
     detailEl.classList.add('open');
-    // Fetch immediately
     fetchJobDetail(jobId);
-    // Start detail polling
     STATE.detailTimers[jobId] = setInterval(() => fetchJobDetail(jobId), 3000);
   }
-
-  // Update the button text
   fetchStatus();
 }
 
 function sortFrameTable(jobId, col) {
   const sort = STATE.frameSortCol[jobId] || { col: 'frame', dir: 1 };
-  if (sort.col === col) {
-    sort.dir *= -1;
-  } else {
-    sort.col = col;
-    sort.dir = 1;
-  }
+  if (sort.col === col) sort.dir *= -1;
+  else { sort.col = col; sort.dir = 1; }
   STATE.frameSortCol[jobId] = sort;
-
   const detail = STATE.jobDetails[jobId];
   if (!detail) return;
   const wrap = document.getElementById('frame-table-wrap-' + jobId);
@@ -2123,10 +1969,11 @@ function cancelJob(id) {
 }
 
 function deleteJob(id) {
-  if (confirm('Permanently delete this job and all outputs?')) {
+  if (confirm('Permanently delete this job?')) {
+    const delOutputs = confirm('Also delete its rendered frames?\n(Only applies to frames stored in the managed RenderHive output folder — custom output folders are never deleted.)');
     STATE.expandedJobs.delete(id);
     if (STATE.detailTimers[id]) { clearInterval(STATE.detailTimers[id]); delete STATE.detailTimers[id]; }
-    postAction('/api/jobs/' + encodeURIComponent(id) + '/delete');
+    postAction('/api/jobs/' + encodeURIComponent(id) + '/delete', { delete_outputs: delOutputs });
   }
 }
 
@@ -2134,17 +1981,32 @@ function retryFailed(id) {
   postAction('/api/jobs/' + encodeURIComponent(id) + '/retry');
 }
 
+function pauseJob(id) {
+  postAction('/api/jobs/' + encodeURIComponent(id) + '/pause');
+}
+
+function resumeJob(id) {
+  postAction('/api/jobs/' + encodeURIComponent(id) + '/resume');
+}
+
+function pauseWorker(id, paused) {
+  postAction('/api/workers/' + encodeURIComponent(id) + '/pause', { paused: paused });
+}
+
+function requeueFrame(jobId, frame) {
+  postAction('/api/jobs/' + encodeURIComponent(jobId) + '/frames/' + frame + '/requeue')
+    .then(() => fetchJobDetail(jobId));
+}
+
 function downloadZip(id) {
   window.open(API_BASE + '/api/jobs/' + encodeURIComponent(id) + '/zip', '_blank');
 }
 
-/* ═══════════════════════════════════════════════════════════
+/* ════════════════════════════════════════════════════════════
    SUBMIT MODAL
-   ═══════════════════════════════════════════════════════════ */
-
+   ════════════════════════════════════════════════════════════ */
 function openSubmitModal() {
   document.getElementById('submit-modal-overlay').classList.add('open');
-  // Reset form
   document.getElementById('job-name-input').value = '';
   document.getElementById('blend-file-input').value = '';
   document.getElementById('blend-path-input').value = '';
@@ -2156,24 +2018,27 @@ function openSubmitModal() {
   document.getElementById('samples-input').value = '';
   document.getElementById('format-select').value = '';
   document.getElementById('output-dir-input').value = '';
+  document.getElementById('priority-select').value = '5';
   document.getElementById('skip-existing-check').checked = true;
   document.getElementById('detected-info').classList.remove('visible');
   document.getElementById('upload-progress').classList.remove('active');
   toggleBlendSource('file');
+  fetch(API_BASE + '/api/settings').then(r => r.json()).then(s => {
+    const root = s.default_output_dir || s.managed_output_dir;
+    if (root) document.getElementById('output-dir-input').placeholder = 'Default: ' + root + '\\<job-name>';
+  }).catch(() => {});
 }
 
 function closeSubmitModal() {
   document.getElementById('submit-modal-overlay').classList.remove('open');
 }
 
-// Close modal on overlay click
 document.getElementById('submit-modal-overlay').addEventListener('click', function(e) {
   if (e.target === this) closeSubmitModal();
 });
 
-// Close modal on Escape
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') closeSubmitModal();
+  if (e.key === 'Escape') { closeSubmitModal(); closeSettingsModal(); }
 });
 
 function toggleBlendSource(mode) {
@@ -2201,7 +2066,7 @@ async function detectSettings() {
   const isFilePath = document.getElementById('toggle-path-btn').classList.contains('active');
 
   btn.disabled = true;
-  btn.textContent = '🔍 Detecting...';
+  btn.textContent = '🔍 Detecting…';
 
   try {
     const fd = new FormData();
@@ -2227,14 +2092,13 @@ async function detectSettings() {
       if (sc.samples) document.getElementById('samples-input').value = sc.samples;
       if (sc.format) document.getElementById('format-select').value = sc.format;
 
+      info.style.color = '';
       info.innerHTML = `✓ Detected: ${esc(sc.engine)} · ${sc.frame_start}–${sc.frame_end} · ${sc.resolution_x}×${sc.resolution_y} · ${sc.samples} spp · ${esc(sc.format)}`;
       info.classList.add('visible');
     } else {
       info.innerHTML = '⚠ Could not detect settings from this file.';
       info.classList.add('visible');
       info.style.color = 'var(--warn)';
-      info.style.borderColor = 'rgba(255,207,77,.2)';
-      info.style.background = 'rgba(255,207,77,.05)';
     }
   } catch (err) {
     info.innerHTML = '⚠ Detection failed: ' + esc(err.message);
@@ -2251,7 +2115,7 @@ async function submitJob() {
   const isPath = document.getElementById('toggle-path-btn').classList.contains('active');
 
   btn.disabled = true;
-  btn.textContent = '⬡ Submitting...';
+  btn.textContent = 'Submitting…';
 
   try {
     const fd = new FormData();
@@ -2260,11 +2124,11 @@ async function submitJob() {
 
     if (isPath) {
       const path = document.getElementById('blend-path-input').value.trim();
-      if (!path) { alert('Please enter a blend file path.'); btn.disabled = false; btn.textContent = '⬡ Queue Job'; return; }
+      if (!path) { alert('Please enter a blend file path.'); btn.disabled = false; btn.textContent = 'Queue Job'; return; }
       fd.append('shared_path', path);
     } else {
       const file = document.getElementById('blend-file-input').files[0];
-      if (!file) { alert('Please select a blend file.'); btn.disabled = false; btn.textContent = '⬡ Queue Job'; return; }
+      if (!file) { alert('Please select a blend file.'); btn.disabled = false; btn.textContent = 'Queue Job'; return; }
       fd.append('blendfile', file);
     }
 
@@ -2290,17 +2154,15 @@ async function submitJob() {
     const outputDir = document.getElementById('output-dir-input').value.trim();
     if (outputDir) fd.append('output_dir', outputDir);
 
+    fd.append('priority', document.getElementById('priority-select').value || '5');
     fd.append('skip_existing', document.getElementById('skip-existing-check').checked ? '1' : '0');
 
-    // Show upload progress for file uploads
     const xhr = new XMLHttpRequest();
     const uploadProgress = document.getElementById('upload-progress');
     const progressBar = document.getElementById('upload-progress-bar');
     const progressText = document.getElementById('upload-progress-text');
 
-    if (!isPath) {
-      uploadProgress.classList.add('active');
-    }
+    if (!isPath) uploadProgress.classList.add('active');
 
     await new Promise((resolve, reject) => {
       xhr.open('POST', API_BASE + '/api/jobs');
@@ -2309,7 +2171,7 @@ async function submitJob() {
         if (e.lengthComputable) {
           const pct = (e.loaded / e.total * 100).toFixed(0);
           progressBar.style.width = pct + '%';
-          progressText.textContent = `Uploading... ${pct}% (${(e.loaded / 1048576).toFixed(1)} / ${(e.total / 1048576).toFixed(1)} MB)`;
+          progressText.textContent = `Uploading… ${pct}% (${(e.loaded / 1048576).toFixed(1)} / ${(e.total / 1048576).toFixed(1)} MB)`;
         }
       };
 
@@ -2333,29 +2195,75 @@ async function submitJob() {
     alert('Submit failed: ' + err.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = '⬡ Queue Job';
+    btn.textContent = 'Queue Job';
     document.getElementById('upload-progress').classList.remove('active');
   }
 }
 
-/* ═══════════════════════════════════════════════════════════
-   POLLING LOOP
-   ═══════════════════════════════════════════════════════════ */
+/* ════════════════════════════════════════════════════════════
+   SETTINGS MODAL
+   ════════════════════════════════════════════════════════════ */
+async function openSettingsModal() {
+  document.getElementById('settings-modal-overlay').classList.add('open');
+  syncThemeButtons();
+  try {
+    const res = await fetch(API_BASE + '/api/settings');
+    const s = await res.json();
+    document.getElementById('default-output-dir-input').value = s.default_output_dir || '';
+    document.getElementById('managed-output-dir').textContent = s.managed_output_dir || '—';
+    document.getElementById('data-dir-display').textContent = s.data_dir || '—';
+  } catch (err) {
+    console.error('Could not load settings:', err);
+  }
+}
 
+function closeSettingsModal() {
+  document.getElementById('settings-modal-overlay').classList.remove('open');
+}
+
+document.getElementById('settings-modal-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeSettingsModal();
+});
+
+async function saveSettings() {
+  const btn = document.getElementById('save-settings-btn');
+  btn.disabled = true;
+  try {
+    const res = await fetch(API_BASE + '/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        default_output_dir: document.getElementById('default-output-dir-input').value.trim()
+      })
+    });
+    if (!res.ok) {
+      let msg = 'HTTP ' + res.status;
+      try { const j = await res.json(); if (j.error) msg = j.error; } catch (e) {}
+      throw new Error(msg);
+    }
+    closeSettingsModal();
+  } catch (err) {
+    alert('Could not save settings: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════
+   POLLING + SSE
+   ════════════════════════════════════════════════════════════ */
 function startPolling() {
   fetchStatus();
   STATE.pollTimer = setInterval(fetchStatus, 2000);
 }
 
-// SSE push: trigger re-fetch on state changes (supplements polling)
-// Debounced so rapid frame_done events don't hammer the UI
 function connectDashboardSSE() {
   let _debounce = null;
   const es = new EventSource(API_BASE + '/api/events');
   es.onmessage = (e) => {
     try {
       const event = JSON.parse(e.data);
-      if (['frame_done', 'job_submitted', 'job_cancelled'].includes(event.type)) {
+      if (['frame_done', 'job_submitted', 'job_cancelled', 'job_paused', 'job_resumed'].includes(event.type)) {
         clearTimeout(_debounce);
         _debounce = setTimeout(() => fetchStatus(), 800);
       }
@@ -2365,10 +2273,8 @@ function connectDashboardSSE() {
 }
 connectDashboardSSE();
 
-// Start immediately
 startPolling();
 
-// Cleanup on page hide
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     clearInterval(STATE.pollTimer);
@@ -2381,6 +2287,23 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+/* Rail active-state on scroll */
+(function () {
+  const sections = ['section-network', 'section-nodes', 'section-jobs'];
+  const links = document.querySelectorAll('.rail a.rail-btn');
+  const obs = new IntersectionObserver((entries) => {
+    entries.forEach(en => {
+      if (en.isIntersecting) {
+        links.forEach(l => l.classList.toggle('active',
+          l.getAttribute('href') === '#' + en.target.id));
+      }
+    });
+  }, { rootMargin: '-30% 0px -60% 0px' });
+  sections.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) obs.observe(el);
+  });
+})();
 </script>
 </body>
 </html>

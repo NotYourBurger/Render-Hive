@@ -34,7 +34,11 @@ def reset_state():
         coord.WORKERS.clear()
     coord.DISCOVERY = None
     coord.BLENDER_PATH = None
+    if coord.SETTINGS_FILE.exists():
+        coord.SETTINGS_FILE.unlink()
     yield
+    if coord.SETTINGS_FILE.exists():
+        coord.SETTINGS_FILE.unlink()
 
 
 @pytest.fixture
@@ -639,12 +643,7 @@ class TestReaper:
         _register_worker(client, "w1")
         with LOCK:
             coord.WORKERS["w1"]["last_seen"] -= coord.WORKER_TIMEOUT + 1
-        # Manually run reaper logic (synchronously, single iteration)
-        now = time.time()
-        with LOCK:
-            for w in coord.WORKERS.values():
-                if w["status"] != "offline" and now - w["last_seen"] > coord.WORKER_TIMEOUT:
-                    w["status"] = "offline"
+        coord._reap_once()
         assert coord.WORKERS["w1"]["status"] == "offline"
 
     def test_reap_requeues_stale_assigned_frame(self, client):
@@ -654,22 +653,20 @@ class TestReaper:
         # Age the frame past the timeout
         with LOCK:
             job["frames"]["1"]["started_at"] = time.time() - coord.FRAME_TIMEOUT - 1
-        now = time.time()
-        with LOCK:
-            for jb in coord.JOBS.values():
-                if jb["status"] not in ("rendering", "queued"):
-                    continue
-                for fno, fr in jb["frames"].items():
-                    if fr["status"] != "assigned":
-                        continue
-                    stale_frame = now - fr.get("started_at", now) > coord.FRAME_TIMEOUT
-                    if stale_frame:
-                        if fr.get("attempts", 0) >= coord.MAX_FRAME_ATTEMPTS:
-                            fr["status"] = "failed"
-                        else:
-                            fr["status"] = "pending"
-                        fr["worker"] = None
+        coord._reap_once()
         assert job["frames"]["1"]["status"] == "pending"
+
+    def test_reap_requeues_frame_of_offline_worker(self, client):
+        """A crashed/offline PC's assigned frames go back to the queue."""
+        _register_worker(client, "w1")
+        job_id, job = _submit_job(client, "job1", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        with LOCK:
+            coord.WORKERS["w1"]["last_seen"] -= coord.WORKER_TIMEOUT + 1
+        coord._reap_once()
+        assert coord.WORKERS["w1"]["status"] == "offline"
+        assert job["frames"]["1"]["status"] == "pending"
+        assert job["frames"]["1"]["worker"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -994,68 +991,6 @@ class TestETA:
 # ---------------------------------------------------------------------------
 
 class TestWorkStealing:
-    def _run_reaper_once(self):
-        """Manually run one reaper iteration (without sleeping)."""
-        now = time.time()
-        with LOCK:
-            for w in coord.WORKERS.values():
-                if w["status"] != "offline" and now - w["last_seen"] > coord.WORKER_TIMEOUT:
-                    w["status"] = "offline"
-                    w["current_job"] = None
-                    w["current_frame"] = None
-                    w["progress"] = 0
-            for job in coord.JOBS.values():
-                if job["status"] not in ("rendering", "queued"):
-                    continue
-                for fno, fr in job["frames"].items():
-                    if fr["status"] != "assigned":
-                        continue
-                    worker = coord.WORKERS.get(fr["worker"])
-                    stale_worker = (worker is None or worker["status"] == "offline")
-                    deadline = fr.get("prefetch_deadline")
-                    if deadline is not None:
-                        stale_frame = now > deadline
-                        if stale_frame and fr.get("progress", 0) == 0:
-                            fr["attempts"] = max(0, fr.get("attempts", 1) - 1)
-                        fr.pop("prefetch_deadline", None)
-                    else:
-                        stale_frame = now - fr.get("started_at", now) > coord.FRAME_TIMEOUT
-                    if stale_worker or stale_frame:
-                        if fr.get("attempts", 0) >= coord.MAX_FRAME_ATTEMPTS:
-                            fr["status"] = "failed"
-                        else:
-                            fr["status"] = "pending"
-                        fr["worker"] = None
-                        fr["progress"] = 0
-            # Work stealing
-            import statistics as _stats
-            idle_workers = [w for w in coord.WORKERS.values()
-                            if w["status"] == "idle" and now - w["last_seen"] < coord.WORKER_TIMEOUT]
-            if idle_workers:
-                all_times = [t for w in coord.WORKERS.values()
-                             for t in w.get("render_times", [])[-10:] if w.get("render_times")]
-                if all_times:
-                    farm_avg = _stats.mean(all_times)
-                    steal_after = max(farm_avg * 3, 180)
-                    for job in coord.JOBS.values():
-                        if job["status"] not in ("rendering", "queued"):
-                            continue
-                        for fno, fr in job["frames"].items():
-                            if fr["status"] != "assigned" or fr.get("progress", 0) >= 5:
-                                continue
-                            if now - fr.get("started_at", now) < steal_after:
-                                continue
-                            assigned_w = coord.WORKERS.get(fr.get("worker"))
-                            if not assigned_w:
-                                continue
-                            w_avg = coord._worker_avg_speed(assigned_w)
-                            if w_avg and w_avg > farm_avg * 1.5:
-                                fr["status"] = "pending"
-                                fr["worker"] = None
-                                fr["progress"] = 0
-                                fr.pop("prefetch_deadline", None)
-            coord._recompute_job_statuses()
-
     def test_reaper_steals_slow_frame(self, client):
         """Frame stuck on slow worker is reclaimed when a faster idle worker exists."""
         _register_worker(client, "slow_w")
@@ -1072,12 +1007,13 @@ class TestWorkStealing:
             fr["worker"] = "slow_w"
             fr["progress"] = 3
             fr["started_at"] = time.time() - 1000  # well past steal_after
+            fr["last_progress_at"] = time.time()   # still reporting -> not stalled
             coord.WORKERS["slow_w"]["status"] = "rendering"
             # idle_w is idle and recently seen
             coord.WORKERS["idle_w"]["status"] = "idle"
             coord.WORKERS["idle_w"]["last_seen"] = time.time()
 
-        self._run_reaper_once()
+        coord._reap_once()
 
         with LOCK:
             fr = coord.JOBS[job_id]["frames"]["1"]
@@ -1096,12 +1032,568 @@ class TestWorkStealing:
             fr["worker"] = "slow_w2"
             fr["progress"] = 3
             fr["started_at"] = time.time() - 1000
+            fr["last_progress_at"] = time.time()  # still reporting -> not stalled
             coord.WORKERS["slow_w2"]["status"] = "rendering"
             # No idle workers exist
 
-        self._run_reaper_once()
+        coord._reap_once()
 
         with LOCK:
             fr = coord.JOBS[job_id]["frames"]["1"]
         # Should remain assigned (no idle worker to steal for)
         assert fr["status"] == "assigned"
+
+    def test_no_steal_to_paused_idle_worker(self, client):
+        """A paused idle worker doesn't count as a steal target."""
+        _register_worker(client, "slow_w3")
+        _register_worker(client, "paused_w")
+        job_id, _ = _submit_job(client, "pausedstealtest", 1, 3)
+
+        with LOCK:
+            coord.WORKERS["slow_w3"]["render_times"] = [300.0] * 5
+            coord.WORKERS["paused_w"]["render_times"] = [30.0] * 5
+            fr = coord.JOBS[job_id]["frames"]["1"]
+            fr["status"] = "assigned"
+            fr["worker"] = "slow_w3"
+            fr["progress"] = 3
+            fr["started_at"] = time.time() - 1000
+            fr["last_progress_at"] = time.time()
+            coord.WORKERS["slow_w3"]["status"] = "rendering"
+            coord.WORKERS["paused_w"]["status"] = "idle"
+            coord.WORKERS["paused_w"]["paused"] = True
+            coord.WORKERS["paused_w"]["last_seen"] = time.time()
+
+        coord._reap_once()
+
+        with LOCK:
+            fr = coord.JOBS[job_id]["frames"]["1"]
+        assert fr["status"] == "assigned"
+
+
+# ---------------------------------------------------------------------------
+# Scheduler: priority, FIFO, blend affinity
+# ---------------------------------------------------------------------------
+
+class TestScheduler:
+    def test_higher_priority_job_dispatched_first(self, client):
+        _register_worker(client, "w1")
+        _, job_a = _submit_job(client, "older_normal", 1, 3)
+        _, job_b = _submit_job(client, "newer_urgent", 1, 3)
+        with LOCK:
+            job_a["created_at"] = 100.0
+            job_b["created_at"] = 200.0
+            job_a["priority"] = 5
+            job_b["priority"] = 9
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"]["job_id"] == job_b["id"]
+
+    def test_fifo_within_same_priority(self, client):
+        _register_worker(client, "w1")
+        _, job_a = _submit_job(client, "first", 1, 3)
+        _, job_b = _submit_job(client, "second", 1, 3)
+        with LOCK:
+            job_a["created_at"] = 100.0
+            job_b["created_at"] = 200.0
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"]["job_id"] == job_a["id"]
+
+    def test_blend_affinity_same_priority(self, client):
+        """Worker keeps pulling from the job whose blend it already cached."""
+        _register_worker(client, "w1")
+        _, job_a = _submit_job(client, "jobA", 1, 3)
+        _, job_b = _submit_job(client, "jobB", 1, 3)
+        with LOCK:
+            job_a["created_at"] = 100.0
+            job_b["created_at"] = 200.0
+            coord.WORKERS["w1"]["last_job"] = job_b["id"]
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"]["job_id"] == job_b["id"]
+
+    def test_affinity_never_overrides_priority(self, client):
+        _register_worker(client, "w1")
+        _, job_a = _submit_job(client, "highprio", 1, 3)
+        _, job_b = _submit_job(client, "cached", 1, 3)
+        with LOCK:
+            job_a["created_at"] = 100.0
+            job_a["priority"] = 8
+            job_b["created_at"] = 50.0
+            job_b["priority"] = 5
+            coord.WORKERS["w1"]["last_job"] = job_b["id"]
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"]["job_id"] == job_a["id"]
+
+    def test_last_job_recorded_on_assignment(self, client):
+        _register_worker(client, "w1")
+        job_id, _ = _submit_job(client, "affjob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert coord.WORKERS["w1"]["last_job"] == job_id
+
+    def test_paused_job_not_dispatched(self, client):
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "pausedjob", 1, 3)
+        with LOCK:
+            job["status"] = "paused"
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"] is None
+
+    def test_job_priority_in_summary(self, client):
+        _, job = _submit_job(client, "pjob", 1, 3)
+        with LOCK:
+            job["priority"] = 7
+        d = client.get("/api/status").get_json()
+        assert d["jobs"][0]["priority"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery: orphaned and stalled frames
+# ---------------------------------------------------------------------------
+
+class TestOrphanRecovery:
+    def test_orphaned_frame_requeued(self, client):
+        """Worker reports idle while a frame is still assigned to it."""
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "orphanjob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        with LOCK:
+            coord.WORKERS["w1"]["status"] = "idle"
+            job["frames"]["1"]["started_at"] = time.time() - coord.ORPHAN_GRACE - 1
+            job["frames"]["1"]["last_progress_at"] = time.time()
+        coord._reap_once()
+        assert job["frames"]["1"]["status"] == "pending"
+        assert job["frames"]["1"]["worker"] is None
+
+    def test_orphan_requeue_does_not_burn_attempt(self, client):
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "orphanjob2", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert job["frames"]["1"]["attempts"] == 1
+        with LOCK:
+            coord.WORKERS["w1"]["status"] = "idle"
+            job["frames"]["1"]["started_at"] = time.time() - coord.ORPHAN_GRACE - 1
+            job["frames"]["1"]["last_progress_at"] = time.time()
+        coord._reap_once()
+        assert job["frames"]["1"]["attempts"] == 0
+
+    def test_fresh_assignment_not_treated_as_orphan(self, client):
+        """Within the grace period an idle-reporting worker keeps its frame."""
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "gracejob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        with LOCK:
+            coord.WORKERS["w1"]["status"] = "idle"
+        coord._reap_once()
+        assert job["frames"]["1"]["status"] == "assigned"
+
+    def test_rendering_worker_not_orphaned(self, client):
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "renderingjob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        with LOCK:
+            job["frames"]["1"]["started_at"] = time.time() - coord.ORPHAN_GRACE - 1
+            job["frames"]["1"]["last_progress_at"] = time.time()
+        coord._reap_once()
+        assert job["frames"]["1"]["status"] == "assigned"
+
+
+class TestStallRecovery:
+    def test_stalled_frame_requeued(self, client):
+        """Worker heartbeats but render makes no progress -> frame requeued."""
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "stalljob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        now = time.time()
+        with LOCK:
+            job["frames"]["1"]["started_at"] = now - coord.STALL_TIMEOUT - 60
+            job["frames"]["1"]["last_progress_at"] = now - coord.STALL_TIMEOUT - 1
+        coord._reap_once()
+        assert job["frames"]["1"]["status"] == "pending"
+
+    def test_progressing_frame_not_stalled(self, client):
+        _register_worker(client, "w1")
+        _, job = _submit_job(client, "okjob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        now = time.time()
+        with LOCK:
+            job["frames"]["1"]["started_at"] = now - coord.STALL_TIMEOUT - 60
+            job["frames"]["1"]["last_progress_at"] = now - 5
+        coord._reap_once()
+        assert job["frames"]["1"]["status"] == "assigned"
+
+    def test_progress_report_refreshes_stall_timer(self, client):
+        _register_worker(client, "w1")
+        job_id, job = _submit_job(client, "refreshjob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        before = job["frames"]["1"]["last_progress_at"]
+        time.sleep(0.01)
+        client.post("/api/workers/w1/progress",
+                    json={"job_id": job_id, "frame": 1, "progress": 42})
+        assert job["frames"]["1"]["last_progress_at"] > before
+
+    def test_progress_marks_worker_rendering(self, client):
+        _register_worker(client, "w1")
+        job_id, _ = _submit_job(client, "wstatusjob", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        client.post("/api/workers/w1/heartbeat", json={"status": "idle"})
+        client.post("/api/workers/w1/progress",
+                    json={"job_id": job_id, "frame": 1, "progress": 10})
+        assert coord.WORKERS["w1"]["status"] == "rendering"
+
+
+# ---------------------------------------------------------------------------
+# Job pause / resume
+# ---------------------------------------------------------------------------
+
+class TestJobPauseResume:
+    def test_pause_sets_status(self, client):
+        job_id, job = _submit_job(client, "pjob1", 1, 3)
+        r = client.post(f"/api/jobs/{job_id}/pause")
+        assert r.status_code == 200
+        assert job["status"] == "paused"
+
+    def test_paused_job_survives_recompute(self, client):
+        job_id, job = _submit_job(client, "pjob2", 1, 3)
+        client.post(f"/api/jobs/{job_id}/pause")
+        with LOCK:
+            coord._recompute_job_statuses()
+        assert job["status"] == "paused"
+
+    def test_resume_requeues(self, client):
+        job_id, job = _submit_job(client, "pjob3", 1, 3)
+        client.post(f"/api/jobs/{job_id}/pause")
+        r = client.post(f"/api/jobs/{job_id}/resume")
+        assert r.status_code == 200
+        assert job["status"] == "queued"
+
+    def test_pause_done_job_rejected(self, client):
+        job_id, job = _submit_job(client, "pjob4", 1, 1)
+        with LOCK:
+            job["frames"]["1"]["status"] = "done"
+            coord._recompute_job_statuses()
+        r = client.post(f"/api/jobs/{job_id}/pause")
+        assert r.status_code == 400
+
+    def test_resume_non_paused_rejected(self, client):
+        job_id, _ = _submit_job(client, "pjob5", 1, 3)
+        r = client.post(f"/api/jobs/{job_id}/resume")
+        assert r.status_code == 400
+
+    def test_pause_nonexistent_404(self, client):
+        assert client.post("/api/jobs/nope/pause").status_code == 404
+
+    def test_inflight_frame_completes_while_paused(self, client):
+        """Pause stops new dispatch but in-flight frames still land."""
+        _register_worker(client, "w1")
+        job_id, job = _submit_job(client, "pjob6", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        client.post(f"/api/jobs/{job_id}/pause")
+        client.post("/api/workers/w1/complete",
+                    data={"job_id": job_id, "frame": "1", "render_time": "5.0"})
+        assert job["frames"]["1"]["status"] == "done"
+        assert job["status"] == "paused"
+
+
+# ---------------------------------------------------------------------------
+# Worker pause / resume
+# ---------------------------------------------------------------------------
+
+class TestWorkerPause:
+    def test_pause_worker(self, client):
+        _register_worker(client, "w1")
+        r = client.post("/api/workers/w1/pause", json={"paused": True})
+        assert r.status_code == 200
+        assert coord.WORKERS["w1"]["paused"] is True
+
+    def test_paused_worker_gets_no_frames(self, client):
+        _register_worker(client, "w1")
+        _submit_job(client, "wpjob", 1, 3)
+        client.post("/api/workers/w1/pause", json={"paused": True})
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"] is None
+
+    def test_resumed_worker_gets_frames(self, client):
+        _register_worker(client, "w1")
+        _submit_job(client, "wpjob2", 1, 3)
+        client.post("/api/workers/w1/pause", json={"paused": True})
+        client.post("/api/workers/w1/pause", json={"paused": False})
+        r = client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        assert r.get_json()["assignment"] is not None
+
+    def test_paused_status_shown(self, client):
+        _register_worker(client, "w1")
+        client.post("/api/workers/w1/pause", json={"paused": True})
+        d = client.get("/api/status").get_json()
+        assert d["workers"][0]["status"] == "paused"
+        assert d["workers"][0]["paused"] is True
+
+    def test_pause_unknown_worker_404(self, client):
+        assert client.post("/api/workers/ghost/pause",
+                           json={"paused": True}).status_code == 404
+
+    def test_paused_worker_gets_no_prefetch(self, client):
+        _register_worker(client, "w1")
+        _submit_job(client, "wpjob3", 1, 5)
+        with LOCK:
+            coord.WORKERS["w1"]["paused"] = True
+            assignments = coord._try_prefetch_frames("w1")
+        assert assignments == []
+
+
+# ---------------------------------------------------------------------------
+# Frame requeue endpoint
+# ---------------------------------------------------------------------------
+
+class TestFrameRequeue:
+    def test_requeue_failed_frame(self, client):
+        job_id, job = _submit_job(client, "rqjob", 1, 3)
+        with LOCK:
+            job["frames"]["2"].update({"status": "failed", "attempts": 3,
+                                       "last_error": "boom"})
+        r = client.post(f"/api/jobs/{job_id}/frames/2/requeue")
+        assert r.status_code == 200
+        fr = job["frames"]["2"]
+        assert fr["status"] == "pending"
+        assert fr["attempts"] == 0
+        assert fr["last_error"] is None
+
+    def test_requeue_stuck_assigned_frame(self, client):
+        _register_worker(client, "w1")
+        job_id, job = _submit_job(client, "rqjob2", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        r = client.post(f"/api/jobs/{job_id}/frames/1/requeue")
+        assert r.status_code == 200
+        assert r.get_json()["was_on"] == "w1"
+        assert job["frames"]["1"]["status"] == "pending"
+
+    def test_requeue_unknown_frame_404(self, client):
+        job_id, _ = _submit_job(client, "rqjob3", 1, 3)
+        assert client.post(f"/api/jobs/{job_id}/frames/99/requeue").status_code == 404
+
+    def test_requeue_unknown_job_404(self, client):
+        assert client.post("/api/jobs/nope/frames/1/requeue").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Priority endpoint
+# ---------------------------------------------------------------------------
+
+class TestPriorityEndpoint:
+    def test_set_priority(self, client):
+        job_id, job = _submit_job(client, "priojob", 1, 3)
+        r = client.post(f"/api/jobs/{job_id}/priority", json={"priority": 9})
+        assert r.status_code == 200
+        assert job["priority"] == 9
+
+    def test_priority_clamped(self, client):
+        job_id, job = _submit_job(client, "priojob2", 1, 3)
+        client.post(f"/api/jobs/{job_id}/priority", json={"priority": 99})
+        assert job["priority"] == 10
+        client.post(f"/api/jobs/{job_id}/priority", json={"priority": -5})
+        assert job["priority"] == 1
+
+    def test_invalid_priority_400(self, client):
+        job_id, _ = _submit_job(client, "priojob3", 1, 3)
+        r = client.post(f"/api/jobs/{job_id}/priority", json={"priority": "abc"})
+        assert r.status_code == 400
+
+    def test_priority_unknown_job_404(self, client):
+        assert client.post("/api/jobs/nope/priority",
+                           json={"priority": 5}).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Settings API + default output directory
+# ---------------------------------------------------------------------------
+
+class TestSettingsAPI:
+    def test_get_settings_defaults(self, client):
+        d = client.get("/api/settings").get_json()
+        assert d["default_output_dir"] == ""
+        assert d["data_dir"] == str(coord.DATA_DIR)
+        assert d["managed_output_dir"] == str(coord.OUTPUT_DIR)
+
+    def test_set_and_get_default_output_dir(self, client, tmp_path):
+        target = str(tmp_path / "renders")
+        r = client.post("/api/settings", json={"default_output_dir": target})
+        assert r.status_code == 200
+        d = client.get("/api/settings").get_json()
+        assert d["default_output_dir"] == target
+
+    def test_invalid_output_dir_rejected(self, client):
+        r = client.post("/api/settings",
+                        json={"default_output_dir": "ZZ:\\no\\such\\drive"})
+        assert r.status_code == 400
+
+    def test_submit_uses_default_output_dir(self, client, tmp_path):
+        target = str(tmp_path / "renders")
+        client.post("/api/settings", json={"default_output_dir": target})
+        r = client.post("/api/jobs", data={
+            "name": "settingsjob", "shared_path": "X:/proj/scene.blend",
+            "frame_start": "1", "frame_end": "2", "format": "PNG",
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        out = Path(coord.JOBS[job_id]["output_dir"])
+        assert out == Path(target) / "settingsjob"
+        assert out.exists()
+
+    def test_explicit_output_dir_beats_default(self, client, tmp_path):
+        client.post("/api/settings",
+                    json={"default_output_dir": str(tmp_path / "default")})
+        explicit = str(tmp_path / "explicit")
+        r = client.post("/api/jobs", data={
+            "name": "explicitjob", "shared_path": "X:/proj/scene.blend",
+            "frame_start": "1", "frame_end": "2", "format": "PNG",
+            "output_dir": explicit,
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        assert Path(coord.JOBS[job_id]["output_dir"]) == Path(explicit)
+
+    def test_job_priority_from_submit_form(self, client, tmp_path):
+        r = client.post("/api/jobs", data={
+            "name": "subprio", "shared_path": "X:/proj/scene.blend",
+            "frame_start": "1", "frame_end": "2", "format": "PNG",
+            "priority": "8",
+        })
+        assert r.status_code == 200
+        job_id = r.get_json()["job_id"]
+        assert coord.JOBS[job_id]["priority"] == 8
+
+
+# ---------------------------------------------------------------------------
+# Job deletion with outputs
+# ---------------------------------------------------------------------------
+
+class TestDeleteOutputs:
+    def test_delete_with_outputs_removes_managed_dir(self, client):
+        job_id, job = _submit_job(client, "deljob", 1, 2)
+        out = Path(coord.OUTPUT_DIR) / "deljob"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "deljob_0001.png").write_bytes(b"fake")
+        client.post(f"/api/jobs/{job_id}/delete", json={"delete_outputs": True})
+        assert not out.exists()
+
+    def test_delete_without_flag_keeps_outputs(self, client):
+        job_id, job = _submit_job(client, "deljob2", 1, 2)
+        out = Path(coord.OUTPUT_DIR) / "deljob2"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "deljob2_0001.png").write_bytes(b"fake")
+        client.post(f"/api/jobs/{job_id}/delete")
+        assert out.exists()
+        import shutil as _sh
+        _sh.rmtree(out, ignore_errors=True)
+
+    def test_delete_never_removes_custom_output_dir(self, client, tmp_path):
+        job_id, job = _submit_job(client, "deljob3", 1, 2)
+        custom = tmp_path / "my_renders"
+        custom.mkdir()
+        (custom / "frame.png").write_bytes(b"fake")
+        with LOCK:
+            job["output_dir"] = str(custom)
+        client.post(f"/api/jobs/{job_id}/delete", json={"delete_outputs": True})
+        assert custom.exists()
+        assert (custom / "frame.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Improved ETA
+# ---------------------------------------------------------------------------
+
+class TestImprovedETA:
+    def _setup_rendering_job(self, client, name, n_frames=5, speed=10.0):
+        _register_worker(client, f"{name}_w")
+        job_id, job = _submit_job(client, name, 1, n_frames)
+        with LOCK:
+            w = coord.WORKERS[f"{name}_w"]
+            w["render_times"] = [speed] * 5
+            w["status"] = "rendering"
+            w["current_job"] = job_id
+            fr = job["frames"]["1"]
+            fr["status"] = "assigned"
+            fr["worker"] = f"{name}_w"
+            job["status"] = "rendering"
+        return job_id, job
+
+    def test_eta_uses_job_workers_speed(self, client):
+        job_id, job = self._setup_rendering_job(client, "etajob", 5, 10.0)
+        with LOCK:
+            s = coord.job_summary(job)
+        # 5 remaining frames at 0.1 fps -> 50s
+        assert s["eta_seconds"] == 50
+
+    def test_eta_credits_partial_progress(self, client):
+        job_id, job = self._setup_rendering_job(client, "etajob2", 5, 10.0)
+        with LOCK:
+            job["frames"]["1"]["progress"] = 50
+            s = coord.job_summary(job)
+        # 5 - 0.5 = 4.5 remaining -> 45s
+        assert s["eta_seconds"] == 45
+
+    def test_queued_job_eta_includes_queue_wait(self, client):
+        job_id, job = self._setup_rendering_job(client, "active", 5, 10.0)
+        _, queued = _submit_job(client, "waiting", 1, 5)
+        with LOCK:
+            job["created_at"] = 100.0
+            queued["created_at"] = 200.0
+        d = client.get("/api/status").get_json()
+        by_name = {j["name"]: j for j in d["jobs"]}
+        active, waiting = by_name["active"], by_name["waiting"]
+        assert active["eta_seconds"] == 50
+        # queued job: 50s queue wait + 50s own work
+        assert waiting["eta_seconds"] == 100
+        assert waiting["eta_queued_behind"] == 50
+
+    def test_elapsed_seconds_reported(self, client):
+        job_id, job = self._setup_rendering_job(client, "eljob", 3, 10.0)
+        with LOCK:
+            job["frames"]["1"]["started_at"] = time.time() - 120
+            s = coord.job_summary(job)
+        assert 118 <= s["elapsed_seconds"] <= 125
+
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+class TestPersistence:
+    def test_save_state_is_valid_json(self, client):
+        _submit_job(client, "persjob", 1, 3)
+        coord.save_state()
+        data = json.loads(coord.STATE_FILE.read_text())
+        assert "persjob" in str(data)
+
+    def test_save_state_leaves_no_tmp_file(self, client):
+        _submit_job(client, "persjob2", 1, 3)
+        coord.save_state()
+        assert not coord.STATE_FILE.with_suffix(".json.tmp").exists()
+
+    def test_load_state_defaults_priority(self, client):
+        _, job = _submit_job(client, "persjob3", 1, 2)
+        with LOCK:
+            job.pop("priority", None)
+        coord.save_state()
+        with LOCK:
+            coord.JOBS.clear()
+        coord.load_state()
+        with LOCK:
+            loaded = next(j for j in coord.JOBS.values() if j["name"] == "persjob3")
+            assert loaded["priority"] == coord.DEFAULT_PRIORITY
+            coord.JOBS.clear()
+
+    def test_load_state_requeues_assigned_frames(self, client):
+        _register_worker(client, "w1")
+        job_id, job = _submit_job(client, "persjob4", 1, 3)
+        client.post("/api/workers/w1/next", json={"id": "w1", "name": "w1"})
+        coord.save_state()
+        with LOCK:
+            coord.JOBS.clear()
+        coord.load_state()
+        with LOCK:
+            loaded = next(j for j in coord.JOBS.values() if j["name"] == "persjob4")
+            assert loaded["frames"]["1"]["status"] == "pending"
+            assert loaded["frames"]["1"]["worker"] is None
+            coord.JOBS.clear()
+
+    def test_data_dir_honors_env_override(self):
+        assert str(coord.DATA_DIR).startswith(
+            os.environ["RENDERHIVE_DATA_DIR"])

@@ -205,6 +205,7 @@ def main():
     print(f"  LAN IP:     {lan_ip}")
     print(f"  Dashboard:  http://{lan_ip}:{args.port}")
     print(f"  Discovery:  UDP port {args.discovery_port}")
+    print(f"  User data:  {DATA_DIR}")
 
     if blender:
         print(f"  Blender:    {blender}")

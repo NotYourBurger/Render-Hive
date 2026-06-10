@@ -34,18 +34,59 @@ from flask import (
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-BASE_DIR     = Path(__file__).resolve().parent
-DATA_DIR     = BASE_DIR / "farm_data"
-BLEND_DIR    = DATA_DIR / "blends"
-OUTPUT_DIR   = DATA_DIR / "output"
-STATE_FILE   = DATA_DIR / "state.json"
+BASE_DIR = Path(__file__).resolve().parent
 
-WORKER_TIMEOUT     = 120
-FRAME_TIMEOUT      = 1800
+
+def _resolve_data_dir():
+    """User data lives in Documents/RenderHive (override: RENDERHIVE_DATA_DIR)."""
+    env = os.environ.get("RENDERHIVE_DATA_DIR")
+    if env:
+        return Path(env)
+    docs = Path.home() / "Documents"
+    base = docs if docs.exists() else Path.home()
+    return base / "RenderHive"
+
+
+DATA_DIR      = _resolve_data_dir()
+BLEND_DIR     = DATA_DIR / "blends"
+OUTPUT_DIR    = DATA_DIR / "output"
+STATE_FILE    = DATA_DIR / "state.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+
+WORKER_TIMEOUT     = 60    # seconds without heartbeat before a worker is offline
+FRAME_TIMEOUT      = 1800  # hard cap on a single frame render
+STALL_TIMEOUT      = 300   # no progress update for this long -> frame requeued
+ORPHAN_GRACE       = 30    # worker reports idle while frame assigned this long -> requeue
 MAX_FRAME_ATTEMPTS = 3
 PREFETCH_THRESHOLD = 75   # % progress that triggers prefetch
 PREFETCH_DEADLINE  = 90   # seconds before stale prefetch is reclaimed
+DEFAULT_PRIORITY   = 5    # job priority 1 (lowest) .. 10 (highest)
 
+
+def _migrate_legacy_data():
+    """One-time copy of the old farm_data folder (next to the program) into
+    the new per-user data directory."""
+    legacy = BASE_DIR / "farm_data"
+    if os.environ.get("RENDERHIVE_DATA_DIR"):
+        return
+    if not legacy.exists() or STATE_FILE.exists():
+        return
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        for item in ("config.json", "state.json", "settings.json"):
+            src = legacy / item
+            if src.exists() and not (DATA_DIR / item).exists():
+                shutil.copy2(src, DATA_DIR / item)
+        for sub in ("blends", "output"):
+            src = legacy / sub
+            if src.exists():
+                shutil.copytree(src, DATA_DIR / sub, dirs_exist_ok=True)
+        print(f"  migrated user data: {legacy} -> {DATA_DIR}")
+    except Exception as e:
+        print(f"warn: data migration failed: {e}")
+
+
+_migrate_legacy_data()
 for d in (DATA_DIR, BLEND_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
@@ -67,12 +108,12 @@ BLENDER_PATH = None   # path to blender executable
 # Blender detection (for probing blend files)
 # ---------------------------------------------------------------------------
 def detect_blender():
-    """Return path to the latest installed Blender 5.x. Falls back to PATH."""
+    """Return path to the newest installed Blender (4.0+). Falls back to PATH."""
     # 1. Explicit override via environment variable
     env = os.environ.get("BLENDER")
     if env and Path(env).exists():
         return env
-    # 2. Scan Windows install directory for any Blender 5.x
+    # 2. Scan Windows install directory for the highest Blender version
     base = Path(r"C:\Program Files\Blender Foundation")
     if base.exists():
         candidates = []
@@ -82,22 +123,22 @@ def detect_blender():
             m = re.match(r"Blender (\d+)\.(\d+)", d.name)
             if m:
                 major, minor = int(m.group(1)), int(m.group(2))
-                if major == 5:
+                if major >= 4:
                     exe = d / "blender.exe"
                     if exe.exists():
-                        candidates.append((minor, str(exe)))
+                        candidates.append(((major, minor), str(exe)))
         if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)  # highest 5.x first
+            candidates.sort(key=lambda x: x[0], reverse=True)  # newest first
             chosen = candidates[0][1]
             if len(candidates) > 1:
                 all_paths = [c[1] for c in candidates]
-                print(f"  Found Blender 5.x installs: {all_paths}")
+                print(f"  Found Blender installs: {all_paths}")
                 print(f"  Using: {chosen}")
             return chosen
     # 3. Fallback: search PATH
     found = shutil.which("blender")
     if found:
-        print(f"  WARNING: No Blender 5.x found in Program Files, using: {found}")
+        print(f"  WARNING: No Blender 4+ found in Program Files, using: {found}")
         return found
     return None
 
@@ -154,9 +195,12 @@ def probe_blend_file(blend_path):
 # Persistence
 # ---------------------------------------------------------------------------
 def save_state():
+    """Atomic write: temp file + rename so a crash can't corrupt state.json."""
     try:
-        with open(STATE_FILE, "w") as f:
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
             json.dump({"jobs": JOBS}, f)
+        os.replace(tmp, STATE_FILE)
     except Exception as e:
         print("warn: could not save state:", e)
 
@@ -167,6 +211,7 @@ def load_state():
             data = json.load(open(STATE_FILE))
             JOBS.update(data.get("jobs", {}))
             for job in JOBS.values():
+                job.setdefault("priority", DEFAULT_PRIORITY)
                 for fr in job["frames"].values():
                     if fr["status"] == "assigned":
                         fr["status"] = "pending"
@@ -176,6 +221,27 @@ def load_state():
                     job["status"] = "queued"
         except Exception as e:
             print("warn: could not load state:", e)
+
+
+# ---------------------------------------------------------------------------
+# Settings (per-node, persisted)
+# ---------------------------------------------------------------------------
+def load_settings():
+    if SETTINGS_FILE.exists():
+        try:
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_settings(settings):
+    try:
+        tmp = SETTINGS_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        print("warn: could not save settings:", e)
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +283,46 @@ def _notify_idle_workers_sse(exclude_wid=None):
         if _wid == exclude_wid:
             continue
         w = WORKERS.get(_wid)
-        if w and w["status"] == "idle":
+        if w and w["status"] == "idle" and not w.get("paused"):
             _push_worker_event(_wid, {"type": "work_available"})
+
+
+def _scheduler_jobs():
+    """Jobs in dispatch order: priority (high first), then submit time (FIFO).
+    Excludes jobs that can't accept work. Call inside LOCK."""
+    skip = ("cancelled", "done", "paused")
+    return [j for j in sorted(JOBS.values(),
+                              key=lambda j: (-j.get("priority", DEFAULT_PRIORITY),
+                                             j["created_at"]))
+            if j["status"] not in skip]
+
+
+def _pick_job_for_worker(wid, jobs_with_pending):
+    """Among the highest-priority jobs with pending frames, prefer the job the
+    worker rendered last (its blend file is already cached on that machine)."""
+    if not jobs_with_pending:
+        return None
+    best = jobs_with_pending[0]
+    w = WORKERS.get(wid)
+    last_job = w.get("last_job") if w else None
+    if last_job and last_job != best["id"]:
+        for job in jobs_with_pending:
+            if job.get("priority", DEFAULT_PRIORITY) != best.get("priority", DEFAULT_PRIORITY):
+                break  # never let affinity override priority
+            if job["id"] == last_job:
+                return job
+    return best
+
+
+def _assignment_payload(job, fno):
+    return {
+        "job_id": job["id"], "frame": int(fno),
+        "blend_filename": job["blend_filename"],
+        "shared_path": job.get("shared_path"),
+        "blend_url": f"/api/jobs/{job['id']}/blend",
+        "engine": job["engine"], "device": job["device"],
+        "samples": job["samples"], "format": job["format"],
+    }
 
 
 def _broadcast_dashboard(event):
@@ -244,7 +348,7 @@ def _farm_fps():
 def _try_prefetch_frames(wid):
     """Pre-assign 0–N pending frames based on worker speed. Must be called inside LOCK."""
     w = WORKERS.get(wid)
-    if not w:
+    if not w or w.get("paused"):
         return []
     already = sum(
         1 for j in JOBS.values() for f in j["frames"].values()
@@ -254,8 +358,7 @@ def _try_prefetch_frames(wid):
     if n_want <= 0:
         return []
     remaining_pending = sum(
-        1 for j in JOBS.values()
-        if j["status"] not in ("cancelled", "done")
+        1 for j in _scheduler_jobs()
         for f in j["frames"].values() if f["status"] == "pending"
     )
     active_workers = sum(1 for w2 in WORKERS.values() if w2["status"] == "rendering")
@@ -263,26 +366,17 @@ def _try_prefetch_frames(wid):
         return []
     assignments = []
     now = time.time()
-    for job in sorted(JOBS.values(), key=lambda x: x["created_at"]):
-        if job["status"] in ("cancelled", "done"):
-            continue
+    for job in _scheduler_jobs():
         for k, fr in sorted(job["frames"].items(), key=lambda kv: int(kv[0])):
             if fr["status"] != "pending":
                 continue
             fr.update({
                 "status": "assigned", "worker": wid,
-                "started_at": now, "progress": 0,
+                "started_at": now, "last_progress_at": now, "progress": 0,
                 "attempts": fr.get("attempts", 0) + 1,
                 "prefetch_deadline": now + PREFETCH_DEADLINE,
             })
-            assignments.append({
-                "job_id": job["id"], "frame": int(k),
-                "blend_filename": job["blend_filename"],
-                "shared_path": job.get("shared_path"),
-                "blend_url": f"/api/jobs/{job['id']}/blend",
-                "engine": job["engine"], "device": job["device"],
-                "samples": job["samples"], "format": job["format"],
-            })
+            assignments.append(_assignment_payload(job, k))
             n_want -= 1
             if n_want <= 0:
                 break
@@ -291,7 +385,19 @@ def _try_prefetch_frames(wid):
     return assignments
 
 
+def _job_fps(job_id):
+    """Combined frames/sec of workers currently rendering this job (inside LOCK)."""
+    fps = 0.0
+    for w in WORKERS.values():
+        if w["status"] == "rendering" and w.get("current_job") == job_id:
+            avg = _worker_avg_speed(w)
+            if avg and avg > 0:
+                fps += 1.0 / avg
+    return fps if fps > 0 else None
+
+
 def job_summary(job):
+    now = time.time()
     frames = job["frames"]
     total = len(frames)
     done = sum(1 for f in frames.values() if f["status"] == "done")
@@ -300,14 +406,19 @@ def job_summary(job):
     times = [f["render_time"] for f in frames.values()
              if f["status"] == "done" and f.get("render_time")]
     avg = sum(times) / len(times) if times else None
-    remaining = total - done - failed
-    # Farm-fps ETA: more accurate than naive per-worker average
-    fps = _farm_fps()
-    if fps and fps > 0 and remaining > 0:
-        eta = remaining / fps
-    elif avg and remaining:
+    remaining = sum(1 for f in frames.values()
+                    if f["status"] in ("pending", "assigned"))
+    # Credit partial progress of in-flight frames so the ETA shrinks smoothly
+    partial = sum(f.get("progress", 0) for f in frames.values()
+                  if f["status"] == "assigned") / 100.0
+    effective_remaining = max(0.0, remaining - partial)
+    # Prefer the speed of workers actually on this job; fall back to farm speed
+    fps = _job_fps(job["id"]) or _farm_fps()
+    if fps and fps > 0 and effective_remaining > 0:
+        eta = effective_remaining / fps
+    elif avg and effective_remaining:
         active = max(1, sum(1 for w in WORKERS.values() if w["status"] == "rendering"))
-        eta = avg * remaining / active
+        eta = avg * effective_remaining / active
     else:
         eta = None
     # ETA confidence based on coefficient of variation of recent render times
@@ -319,11 +430,22 @@ def job_summary(job):
         confidence = max(0, min(99, int(100 * (1 - cv))))
     else:
         confidence = None
+    # Elapsed wall-clock time for the job
+    starts = [f["started_at"] for f in frames.values() if f.get("started_at")]
+    finishes = [f["finished_at"] for f in frames.values() if f.get("finished_at")]
+    if starts:
+        if job["status"] in ("done", "failed", "cancelled") and finishes:
+            elapsed = max(finishes) - min(starts)
+        else:
+            elapsed = now - min(starts)
+    else:
+        elapsed = None
     return {
         "id": job["id"], "name": job["name"], "status": job["status"],
         "blend_filename": job["blend_filename"],
         "frame_start": job["frame_start"], "frame_end": job["frame_end"],
         "frame_step": job["frame_step"],
+        "priority": job.get("priority", DEFAULT_PRIORITY),
         "engine": job["engine"] or "(from file)",
         "device": job["device"] or "(from file)",
         "samples": job["samples"] or "(from file)",
@@ -331,6 +453,7 @@ def job_summary(job):
         "avg_render_time": round(avg, 1) if avg else None,
         "eta_seconds": round(eta) if eta else None,
         "eta_confidence": confidence,
+        "elapsed_seconds": round(elapsed) if elapsed else None,
         "farm_fps": round(fps, 4) if fps else None,
         "created_at": job["created_at"],
         "shared_path": job.get("shared_path"),
@@ -341,80 +464,112 @@ def job_summary(job):
 def reap_dead_workers_and_frames():
     while True:
         time.sleep(10)
+        _reap_once()
+
+
+def _reap_once(now=None):
+    """One pass of dead-worker / lost-frame recovery. Called by the reaper
+    thread every 10s; callable directly from tests."""
+    if now is None:
         now = time.time()
-        with LOCK:
-            for w in WORKERS.values():
-                if w["status"] != "offline" and now - w["last_seen"] > WORKER_TIMEOUT:
-                    w["status"] = "offline"
-                    w["current_job"] = None
-                    w["current_frame"] = None
-                    w["progress"] = 0
-            frames_recovered = False
-            for job in JOBS.values():
-                if job["status"] not in ("rendering", "queued"):
+    with LOCK:
+        for w in WORKERS.values():
+            if w["status"] != "offline" and now - w["last_seen"] > WORKER_TIMEOUT:
+                w["status"] = "offline"
+                w["current_job"] = None
+                w["current_frame"] = None
+                w["progress"] = 0
+        frames_recovered = False
+        for job in JOBS.values():
+            if job["status"] not in ("rendering", "queued", "paused"):
+                continue
+            for fno, fr in job["frames"].items():
+                if fr["status"] != "assigned":
                     continue
-                for fno, fr in job["frames"].items():
-                    if fr["status"] != "assigned":
-                        continue
-                    worker = WORKERS.get(fr["worker"])
-                    stale_worker = (worker is None or worker["status"] == "offline")
-                    # Prefetch frames use a short deadline; normal frames use FRAME_TIMEOUT
-                    deadline = fr.get("prefetch_deadline")
-                    if deadline is not None:
-                        stale_frame = now > deadline
-                        if stale_frame and fr.get("progress", 0) == 0:
-                            fr["attempts"] = max(0, fr.get("attempts", 1) - 1)
+                worker = WORKERS.get(fr["worker"])
+                stale_worker = (worker is None or worker["status"] == "offline")
+                # Orphaned: the worker is alive and reports idle, yet this
+                # frame is still assigned to it (worker crashed mid-render
+                # or silently dropped the assignment).
+                orphaned = (worker is not None and worker["status"] == "idle"
+                            and fr.get("prefetch_deadline") is None
+                            and now - fr.get("started_at", now) > ORPHAN_GRACE)
+                # Stalled: worker still heartbeats but the render makes no
+                # progress (hung Blender, dead GPU).
+                stalled = (fr.get("prefetch_deadline") is None
+                           and now - fr.get("last_progress_at",
+                                            fr.get("started_at", now)) > STALL_TIMEOUT)
+                # Prefetch frames use a short deadline; normal frames use FRAME_TIMEOUT
+                deadline = fr.get("prefetch_deadline")
+                if deadline is not None:
+                    stale_frame = now > deadline
+                    if stale_frame and fr.get("progress", 0) == 0:
+                        fr["attempts"] = max(0, fr.get("attempts", 1) - 1)
+                    if stale_frame:
                         fr.pop("prefetch_deadline", None)
+                else:
+                    stale_frame = now - fr.get("started_at", now) > FRAME_TIMEOUT
+                if stale_worker or stale_frame or orphaned or stalled:
+                    if orphaned:
+                        # Not the frame's fault — don't burn an attempt
+                        fr["attempts"] = max(0, fr.get("attempts", 1) - 1)
+                        print(f"  [RECOVER] frame {fno} orphaned by idle "
+                              f"worker {fr['worker']} — requeued")
+                    elif stalled and not stale_worker and not stale_frame:
+                        print(f"  [RECOVER] frame {fno} stalled on "
+                              f"worker {fr['worker']} — requeued")
+                    if fr.get("attempts", 0) >= MAX_FRAME_ATTEMPTS:
+                        fr["status"] = "failed"
                     else:
-                        stale_frame = now - fr.get("started_at", now) > FRAME_TIMEOUT
-                    if stale_worker or stale_frame:
-                        if fr.get("attempts", 0) >= MAX_FRAME_ATTEMPTS:
-                            fr["status"] = "failed"
-                        else:
-                            fr["status"] = "pending"
-                            frames_recovered = True
-                        fr["worker"] = None
-                        fr["progress"] = 0
-            if frames_recovered:
-                _notify_idle_workers_sse()
-            # Work stealing: reclaim low-progress frames from abnormally slow workers
-            # Only when at least one idle worker is waiting for work
-            idle_workers = [w for w in WORKERS.values()
-                            if w["status"] == "idle" and now - w["last_seen"] < WORKER_TIMEOUT]
-            if idle_workers:
-                all_times = [t for w in WORKERS.values()
-                             for t in w.get("render_times", [])[-10:] if w.get("render_times")]
-                if all_times:
-                    farm_avg = statistics.mean(all_times)
-                    steal_after = max(farm_avg * 3, 180)
-                    for job in JOBS.values():
-                        if job["status"] not in ("rendering", "queued"):
+                        fr["status"] = "pending"
+                        frames_recovered = True
+                    fr["worker"] = None
+                    fr["progress"] = 0
+                    fr.pop("prefetch_deadline", None)
+        if frames_recovered:
+            _notify_idle_workers_sse()
+        # Work stealing: reclaim low-progress frames from abnormally slow workers
+        # Only when at least one idle worker is waiting for work
+        idle_workers = [w for w in WORKERS.values()
+                        if w["status"] == "idle" and not w.get("paused")
+                        and now - w["last_seen"] < WORKER_TIMEOUT]
+        if idle_workers:
+            all_times = [t for w in WORKERS.values()
+                         for t in w.get("render_times", [])[-10:] if w.get("render_times")]
+            if all_times:
+                farm_avg = statistics.mean(all_times)
+                steal_after = max(farm_avg * 3, 180)
+                for job in JOBS.values():
+                    if job["status"] not in ("rendering", "queued"):
+                        continue
+                    for fno, fr in job["frames"].items():
+                        if fr["status"] != "assigned" or fr.get("progress", 0) >= 5:
                             continue
-                        for fno, fr in job["frames"].items():
-                            if fr["status"] != "assigned" or fr.get("progress", 0) >= 5:
-                                continue
-                            if now - fr.get("started_at", now) < steal_after:
-                                continue
-                            assigned_w = WORKERS.get(fr.get("worker"))
-                            if not assigned_w:
-                                continue
-                            w_avg = _worker_avg_speed(assigned_w)
-                            if w_avg and w_avg > farm_avg * 1.5:
-                                fr["status"] = "pending"
-                                fr["worker"] = None
-                                fr["progress"] = 0
-                                fr.pop("prefetch_deadline", None)
-                                print(f"  [STEAL] frame {fno} reclaimed "
-                                      f"(worker avg {round(w_avg)}s vs farm avg {round(farm_avg)}s)")
-                                for iw in idle_workers:
-                                    _push_worker_event(iw["id"], {"type": "work_available"})
-            _recompute_job_statuses()
-        save_state()
+                        if now - fr.get("started_at", now) < steal_after:
+                            continue
+                        assigned_w = WORKERS.get(fr.get("worker"))
+                        if not assigned_w:
+                            continue
+                        w_avg = _worker_avg_speed(assigned_w)
+                        if w_avg and w_avg > farm_avg * 1.5:
+                            fr["status"] = "pending"
+                            fr["worker"] = None
+                            fr["progress"] = 0
+                            fr.pop("prefetch_deadline", None)
+                            print(f"  [STEAL] frame {fno} reclaimed "
+                                  f"(worker avg {round(w_avg)}s vs farm avg {round(farm_avg)}s)")
+                            for iw in idle_workers:
+                                _push_worker_event(iw["id"], {"type": "work_available"})
+        _recompute_job_statuses()
+    save_state()
+    # Wake remote workers (UDP) so recovered frames get picked up quickly
+    if frames_recovered and DISCOVERY:
+        DISCOVERY.broadcast_wake()
 
 
 def _recompute_job_statuses():
     for job in JOBS.values():
-        if job["status"] == "cancelled":
+        if job["status"] in ("cancelled", "paused"):
             continue
         statuses = [f["status"] for f in job["frames"].values()]
         if all(s in ("done", "failed") for s in statuses):
@@ -451,13 +606,20 @@ def api_status():
             # find current job name
             cjob = JOBS.get(w.get("current_job"))
             cjob_name = cjob["name"] if cjob else None
+            if offline:
+                shown_status = "offline"
+            elif w.get("paused") and w["status"] != "rendering":
+                shown_status = "paused"
+            else:
+                shown_status = w["status"]
             workers.append({
                 "id": w["id"], "name": w["name"],
                 "hostname": w.get("hostname", "?"),
                 "gpu_name": w.get("gpu_name", "?"),
                 "os": w.get("os", "?"),
                 "blender_version": w.get("blender_version", "?"),
-                "status": "offline" if offline else w["status"],
+                "status": shown_status,
+                "paused": bool(w.get("paused")),
                 "current_job": w["current_job"],
                 "current_job_name": cjob_name,
                 "current_frame": w["current_frame"],
@@ -477,6 +639,25 @@ def api_status():
                 hostname_stats[h]["jobs_active"].add(w["current_job"])
         jobs = [job_summary(j) for j in
                 sorted(JOBS.values(), key=lambda x: x["created_at"], reverse=True)]
+        # Queue-aware ETA: jobs are dispatched in priority/FIFO order, so a
+        # queued job can't start until the active jobs ahead of it finish.
+        summaries_by_id = {s["id"]: s for s in jobs}
+        farm = _farm_fps()
+        cum = 0.0
+        for job in _scheduler_jobs():
+            s = summaries_by_id.get(job["id"])
+            if not s:
+                continue
+            own = s["eta_seconds"]
+            if own is None and farm and farm > 0:
+                rem = sum(1 for f in job["frames"].values()
+                          if f["status"] in ("pending", "assigned"))
+                own = rem / farm if rem else None
+            if s["status"] == "queued" and s["rendering"] == 0 and own is not None:
+                s["eta_seconds"] = round(own + cum)
+                s["eta_queued_behind"] = round(cum) if cum > 0 else None
+            if own is not None:
+                cum += own
 
     # peers from discovery
     peers = []
@@ -569,6 +750,10 @@ def api_submit_job():
     skip_existing = form.get("skip_existing") in ("1", "true", "on")
     shared_path = (form.get("shared_path") or "").strip()
     output_dir_override = (form.get("output_dir") or "").strip()
+    try:
+        priority = max(1, min(10, int(form.get("priority") or DEFAULT_PRIORITY)))
+    except ValueError:
+        priority = DEFAULT_PRIORITY
 
     blend_filename = None
     blend_path = None
@@ -619,8 +804,13 @@ def api_submit_job():
     if output_dir_override:
         job_out = Path(output_dir_override)
     else:
-        job_out = OUTPUT_DIR / name
-    job_out.mkdir(parents=True, exist_ok=True)
+        default_root = (load_settings().get("default_output_dir") or "").strip()
+        job_out = (Path(default_root) if default_root else OUTPUT_DIR) / name
+    try:
+        job_out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return jsonify({"error": f"Cannot create output directory "
+                        f"'{job_out}': {e}"}), 400
     ext = EXT_FOR_FORMAT.get(out_format, "png")
 
     frames = {}
@@ -642,6 +832,7 @@ def api_submit_job():
         "engine": engine, "device": device, "samples": samples,
         "format": out_format, "ext": ext,
         "output_dir": str(job_out),
+        "priority": priority,
         "status": "queued", "created_at": time.time(),
         "frames": frames,
     }
@@ -720,12 +911,22 @@ def api_cancel(job_id):
 
 @app.route("/api/jobs/<job_id>/delete", methods=["POST"])
 def api_delete(job_id):
+    d = request.get_json(force=True, silent=True) or {}
+    delete_outputs = bool(d.get("delete_outputs"))
     with LOCK:
         job = JOBS.pop(job_id, None)
     if job and job.get("blend_path") and os.path.exists(job["blend_path"]):
         try:
             os.remove(job["blend_path"])
         except OSError:
+            pass
+    if job and delete_outputs and job.get("output_dir"):
+        # Only delete output folders we manage — never a user-chosen custom path
+        out = Path(job["output_dir"]).resolve()
+        try:
+            if out.is_relative_to(OUTPUT_DIR.resolve()) and out != OUTPUT_DIR.resolve():
+                shutil.rmtree(out, ignore_errors=True)
+        except (OSError, ValueError):
             pass
     save_state()
     return jsonify({"ok": bool(job)})
@@ -752,6 +953,77 @@ def api_retry(job_id):
     if DISCOVERY:
         DISCOVERY.broadcast_wake()
     return jsonify({"ok": True, "retried": retried})
+
+
+@app.route("/api/jobs/<job_id>/pause", methods=["POST"])
+def api_pause(job_id):
+    """Stop handing out new frames for this job. In-flight frames finish."""
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            abort(404)
+        if job["status"] not in ("queued", "rendering"):
+            return jsonify({"error": f"cannot pause a {job['status']} job"}), 400
+        job["status"] = "paused"
+        _broadcast_dashboard({"type": "job_paused", "job_id": job_id})
+    save_state()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/jobs/<job_id>/resume", methods=["POST"])
+def api_resume(job_id):
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            abort(404)
+        if job["status"] != "paused":
+            return jsonify({"error": "job is not paused"}), 400
+        job["status"] = "queued"
+        _recompute_job_statuses()
+        _notify_idle_workers_sse()
+        _broadcast_dashboard({"type": "job_resumed", "job_id": job_id})
+    save_state()
+    if DISCOVERY:
+        DISCOVERY.broadcast_wake()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/jobs/<job_id>/priority", methods=["POST"])
+def api_set_priority(job_id):
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        priority = max(1, min(10, int(d.get("priority", DEFAULT_PRIORITY))))
+    except (TypeError, ValueError):
+        return jsonify({"error": "priority must be an integer 1-10"}), 400
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            abort(404)
+        job["priority"] = priority
+    save_state()
+    return jsonify({"ok": True, "priority": priority})
+
+
+@app.route("/api/jobs/<job_id>/frames/<int:frame_num>/requeue", methods=["POST"])
+def api_requeue_frame(job_id, frame_num):
+    """Force a single frame back into the queue (failed, stuck or done)."""
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            abort(404)
+        fr = job["frames"].get(str(frame_num))
+        if not fr:
+            abort(404)
+        prev_worker = fr.get("worker")
+        fr.update({"status": "pending", "worker": None, "progress": 0,
+                   "attempts": 0, "last_error": None})
+        fr.pop("prefetch_deadline", None)
+        _recompute_job_statuses()
+        _notify_idle_workers_sse()
+    save_state()
+    if DISCOVERY:
+        DISCOVERY.broadcast_wake()
+    return jsonify({"ok": True, "frame": frame_num, "was_on": prev_worker})
 
 
 @app.route("/api/jobs/<job_id>/blend")
@@ -825,6 +1097,21 @@ def api_heartbeat(wid):
     return jsonify({"ok": True})
 
 
+@app.route("/api/workers/<wid>/pause", methods=["POST"])
+def api_worker_pause(wid):
+    """Enable/disable a render node. Paused workers get no new frames."""
+    d = request.get_json(force=True, silent=True) or {}
+    paused = bool(d.get("paused", True))
+    with LOCK:
+        w = WORKERS.get(wid)
+        if not w:
+            abort(404)
+        w["paused"] = paused
+        if not paused:
+            _push_worker_event(wid, {"type": "work_available"})
+    return jsonify({"ok": True, "paused": paused})
+
+
 @app.route("/api/workers/<wid>/next", methods=["POST"])
 def api_next_frame(wid):
     """Pull-based scheduling with auto-registration."""
@@ -850,35 +1137,32 @@ def api_next_frame(wid):
                 return jsonify({"reregister": True})
         w["last_seen"] = time.time()
 
-        for job in sorted(JOBS.values(), key=lambda x: x["created_at"]):
-            if job["status"] in ("cancelled", "done"):
-                continue
-            pending = sorted((int(k) for k, v in job["frames"].items()
-                              if v["status"] == "pending"))
-            if not pending:
-                continue
-            fno = pending[0]
-            fr = job["frames"][str(fno)]
-            fr["status"] = "assigned"
-            fr["worker"] = wid
-            fr["started_at"] = time.time()
-            fr["attempts"] = fr.get("attempts", 0) + 1
-            fr["progress"] = 0
-            w["status"] = "rendering"
-            w["current_job"] = job["id"]
-            w["current_frame"] = fno
-            w["progress"] = 0
-            job["status"] = "rendering"
-            assignment = {
-                "job_id": job["id"], "frame": fno,
-                "blend_filename": job["blend_filename"],
-                "shared_path": job.get("shared_path"),
-                "blend_url": f"/api/jobs/{job['id']}/blend",
-                "engine": job["engine"], "device": job["device"],
-                "samples": job["samples"], "format": job["format"],
-            }
-            save_state()
-            return jsonify({"assignment": assignment})
+        if not w.get("paused"):
+            jobs_with_pending = [
+                job for job in _scheduler_jobs()
+                if any(v["status"] == "pending" for v in job["frames"].values())
+            ]
+            job = _pick_job_for_worker(wid, jobs_with_pending)
+            if job:
+                now = time.time()
+                fno = min(int(k) for k, v in job["frames"].items()
+                          if v["status"] == "pending")
+                fr = job["frames"][str(fno)]
+                fr["status"] = "assigned"
+                fr["worker"] = wid
+                fr["started_at"] = now
+                fr["last_progress_at"] = now
+                fr["attempts"] = fr.get("attempts", 0) + 1
+                fr["progress"] = 0
+                w["status"] = "rendering"
+                w["current_job"] = job["id"]
+                w["current_frame"] = fno
+                w["last_job"] = job["id"]
+                w["progress"] = 0
+                job["status"] = "rendering"
+                assignment = _assignment_payload(job, fno)
+                save_state()
+                return jsonify({"assignment": assignment})
         w["status"] = "idle"
         w["current_job"] = None
         w["current_frame"] = None
@@ -895,6 +1179,10 @@ def api_progress(wid):
         if w:
             w["last_seen"] = time.time()
             w["progress"] = d.get("progress", 0)
+            w["status"] = "rendering"
+            if d.get("job_id"):
+                w["current_job"] = d["job_id"]
+                w["current_frame"] = d.get("frame")
         job = JOBS.get(d.get("job_id"))
         if job:
             if job["status"] == "cancelled":
@@ -907,6 +1195,7 @@ def api_progress(wid):
                     elif fr["status"] == "assigned":
                         progress = d.get("progress", 0)
                         fr["progress"] = progress
+                        fr["last_progress_at"] = time.time()
                         if not cancel and progress >= PREFETCH_THRESHOLD:
                             assignments = _try_prefetch_frames(wid)
                             if assignments:
@@ -916,9 +1205,17 @@ def api_progress(wid):
 
 @app.route("/api/workers/<wid>/complete", methods=["POST"])
 def api_complete(wid):
-    job_id = request.form["job_id"]
-    frame = int(request.form["frame"])
-    render_time = float(request.form.get("render_time", 0))
+    job_id = request.form.get("job_id")
+    try:
+        frame = int(request.form.get("frame", ""))
+    except ValueError:
+        return jsonify({"error": "missing or invalid frame"}), 400
+    if not job_id:
+        return jsonify({"error": "missing job_id"}), 400
+    try:
+        render_time = float(request.form.get("render_time", 0))
+    except ValueError:
+        render_time = 0.0
     with LOCK:
         job = JOBS.get(job_id)
         w = WORKERS.get(wid)
@@ -1000,6 +1297,35 @@ def api_fail(wid):
     save_state()
     print(f"[FAIL] worker={wid} job={job_id} frame={frame}\n{log[-500:]}")
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Settings API
+# ---------------------------------------------------------------------------
+@app.route("/api/settings", methods=["GET"])
+def api_get_settings():
+    s = load_settings()
+    return jsonify({
+        "default_output_dir": s.get("default_output_dir", ""),
+        "data_dir": str(DATA_DIR),
+        "managed_output_dir": str(OUTPUT_DIR),
+    })
+
+
+@app.route("/api/settings", methods=["POST"])
+def api_set_settings():
+    d = request.get_json(force=True, silent=True) or {}
+    s = load_settings()
+    if "default_output_dir" in d:
+        path = (d.get("default_output_dir") or "").strip()
+        if path:
+            try:
+                Path(path).mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                return jsonify({"error": f"Cannot use '{path}': {e}"}), 400
+        s["default_output_dir"] = path
+    save_settings(s)
+    return jsonify({"ok": True, "settings": s})
 
 
 # ---------------------------------------------------------------------------
