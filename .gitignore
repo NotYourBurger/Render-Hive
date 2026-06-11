@@ -15,4 +15,6 @@ Thumbs.db
 .env
 config.json
 state.json
+settings.json
+farm_data/
 ui-reference/

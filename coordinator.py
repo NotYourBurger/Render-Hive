@@ -76,7 +76,16 @@ def _migrate_legacy_data():
         for item in ("config.json", "state.json", "settings.json"):
             src = legacy / item
             if src.exists() and not (DATA_DIR / item).exists():
-                shutil.copy2(src, DATA_DIR / item)
+                if item == "config.json":
+                    # node_id must be unique per machine. A farm_data folder
+                    # that came from a git clone or a copied install carries
+                    # another PC's id, which makes peers ignore each other.
+                    cfg = json.loads(src.read_text(encoding="utf-8"))
+                    cfg.pop("node_id", None)
+                    (DATA_DIR / item).write_text(
+                        json.dumps(cfg, indent=2), encoding="utf-8")
+                else:
+                    shutil.copy2(src, DATA_DIR / item)
         for sub in ("blends", "output"):
             src = legacy / sub
             if src.exists():

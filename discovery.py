@@ -30,6 +30,7 @@ class PeerDiscovery:
         self.lock = threading.Lock()
         self._running = False
         self._wake_event = threading.Event()
+        self._dup_id_warned = False
         self._local_ip = self._detect_lan_ip()
 
     def _detect_lan_ip(self):
@@ -169,9 +170,21 @@ class PeerDiscovery:
                 msg = json.loads(data.decode("utf-8"))
                 if msg.get("magic") != MAGIC:
                     continue
-                if msg["type"] == "announce" and msg["node_id"] != self.node_id:
+                if msg["node_id"] == self.node_id:
+                    # Our own ID arriving from an IP that isn't ours means
+                    # another PC is running with a copied config.json.
+                    if (msg["type"] == "announce"
+                            and addr[0] not in self._get_local_ips()
+                            and not self._dup_id_warned):
+                        self._dup_id_warned = True
+                        print(f"  discovery: WARNING — node at {addr[0]} announces "
+                              f"the same node ID '{self.node_id}' as this PC. "
+                              f"Peers will ignore each other. Delete the 'node_id' "
+                              f"entry from config.json on one PC and restart it.")
+                    continue
+                if msg["type"] == "announce":
                     self._handle_announce(msg, addr[0])
-                elif msg["type"] == "wake" and msg["node_id"] != self.node_id:
+                elif msg["type"] == "wake":
                     self._wake_event.set()
             except socket.timeout:
                 continue
