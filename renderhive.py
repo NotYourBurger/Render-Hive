@@ -232,6 +232,10 @@ def main():
     )
     discovery.start()
     print("  [✓] Peer discovery started")
+    print(f"      If other PCs don't appear within ~15s, allow inbound "
+          f"UDP {args.discovery_port} and TCP {args.port} for Python in "
+          f"Windows Firewall, and make sure the network profile is "
+          f"'Private' on every PC.")
 
     # 2. Create and configure the coordinator Flask app
     flask_app = create_app(discovery=discovery, blender_path=blender)
