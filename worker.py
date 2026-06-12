@@ -155,11 +155,13 @@ RE_TILES  = re.compile(r"Rendered\s+(\d+)\s*/\s*(\d+)\s+Tiles")
 
 class Worker:
     def __init__(self, gpu_index, device, blender, shared_root,
-                 name=None, discovery=None, server=None):
+                 name=None, discovery=None, server=None, home_server=None):
         """
         Args:
             discovery: PeerDiscovery instance (for auto-discovery mode)
             server: explicit coordinator URL (for manual/standalone mode)
+            home_server: this node's OWN coordinator URL — honey earned by
+                rendering frames (for any coordinator) is banked there
         """
         self.gpu_index = gpu_index
         self.device = device
@@ -167,6 +169,7 @@ class Worker:
         self.shared_root = shared_root
         self.discovery = discovery
         self.server = server.rstrip("/") if server else None
+        self.home_server = home_server.rstrip("/") if home_server else None
         hostname = socket.gethostname()
         self.gpu_name = detect_gpu_name(gpu_index)
         self.id = name or f"{hostname}-gpu{gpu_index}"
@@ -294,13 +297,39 @@ class Worker:
                         f"{coord_url}/api/workers/{self.id}/complete",
                         data=data, timeout=300)
                 r.raise_for_status()
+                try:
+                    earned = int(r.json().get("honey", 0))
+                except Exception:
+                    earned = 0
+                if earned > 0:
+                    self.bank_honey(earned)
                 return True
             except (requests.RequestException, OSError) as e:
                 print(f"  upload attempt {attempt + 1}/3 failed: {e}")
                 time.sleep(2 * (attempt + 1))
         return False
 
+    def bank_honey(self, amount):
+        """Credit honey earned for a rendered frame to this node's own
+        coordinator — the jar that gates job submission lives there. Best
+        effort: a node without a local coordinator just doesn't bank."""
+        if not self.home_server:
+            return
+        try:
+            r = requests.post(f"{self.home_server}/api/honey/earn",
+                              json={"amount": amount, "worker": self.id},
+                              timeout=10)
+            d = r.json()
+            if d.get("ok"):
+                print(f"  +{amount} honey (jar: {d.get('balance')})")
+        except (requests.RequestException, ValueError):
+            pass
+
     def resolve_blend(self, coord_url, assign):
+        # A packed project is self-contained — prefer it even when the job
+        # was submitted via shared path (the share may not be mounted here)
+        if assign.get("packed"):
+            return self.resolve_packed_blend(coord_url, assign)
         if assign.get("shared_path"):
             sp = assign["shared_path"]
             if self.shared_root and not os.path.isabs(sp):
@@ -320,6 +349,55 @@ class Worker:
                         f.write(chunk)
                 tmp.rename(local)
         return str(local)
+
+    def resolve_packed_blend(self, coord_url, assign):
+        """Download the packed project zip (blend + localized dependencies),
+        extract it into the cache and return the path of the blend inside.
+        The blend's //deps/... relative paths then resolve locally."""
+        import zipfile
+        jobdir = self.cache / f"{assign['job_id']}_pack"
+        blend_local = jobdir / assign["blend_filename"]
+        if blend_local.exists():
+            return str(blend_local)
+        print(f"  downloading packed project for job {assign['job_id']} ...")
+
+        last_ping = [time.time()]
+
+        def ping():
+            # Packed projects can be many GB. Without progress updates the
+            # coordinator's stall detector would requeue the frame while we
+            # are still transferring — keep its last_progress_at fresh.
+            if time.time() - last_ping[0] > 10:
+                self.report_progress(coord_url, assign["job_id"],
+                                     assign["frame"], 0)
+                last_ping[0] = time.time()
+
+        ztmp = self.cache / f"{assign['job_id']}_pack.zip.part"
+        got = 0
+        with requests.get(coord_url + assign["blend_url"],
+                          stream=True, timeout=600) as r:
+            r.raise_for_status()
+            with open(ztmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+                    got += len(chunk)
+                    ping()
+        print(f"  downloaded {got / 1048576:.0f} MB — extracting ...")
+        # Extract to a temp dir and rename, so a crash mid-extract can't
+        # leave a half-complete project that looks usable
+        tmpdir = jobdir.with_name(jobdir.name + ".part")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        with zipfile.ZipFile(ztmp) as z:
+            for member in z.infolist():
+                z.extract(member, tmpdir)
+                ping()
+        ztmp.unlink()
+        shutil.rmtree(jobdir, ignore_errors=True)
+        tmpdir.rename(jobdir)
+        if not blend_local.exists():
+            raise RuntimeError(
+                f"packed project did not contain {assign['blend_filename']}")
+        return str(blend_local)
 
     def render_frame(self, coord_url, assign):
         """Render one frame; on any unexpected error tell the coordinator so
@@ -594,7 +672,8 @@ def main():
 
     Worker(gpu_index=args.gpu, device=args.device, blender=blender,
            shared_root=args.shared_root, name=args.name,
-           discovery=discovery, server=args.server).run()
+           discovery=discovery, server=args.server,
+           home_server=f"http://127.0.0.1:{args.http_port}").run()
 
 
 if __name__ == "__main__":

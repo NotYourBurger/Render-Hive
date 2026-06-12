@@ -527,6 +527,8 @@ section { margin-bottom: 26px; scroll-margin-top: 20px; }
 .status-badge.failed    { background: var(--bad-soft); color: var(--bad); }
 .status-badge.cancelled { background: var(--panel-3); color: var(--dim); }
 .status-badge.paused    { background: var(--warn-soft); color: var(--warn); }
+.status-badge.packing   { background: var(--warn-soft); color: var(--warn); }
+.status-badge.packing .status-dot { animation: pulse 1.4s infinite; }
 
 /* ════════════════════════════════════════════════════════════
    JOB CARDS
@@ -567,6 +569,11 @@ section { margin-bottom: 26px; scroll-margin-top: 20px; }
 .chip.samples { background: var(--panel-3); color: var(--dim); }
 .chip.prio-high { background: var(--bad-soft); color: var(--bad); }
 .chip.prio-low { background: var(--panel-3); color: var(--dim); }
+.chip.packed { background: var(--accent-soft); color: var(--accent); }
+.pack-warn {
+  font-size: .72rem; color: var(--warn);
+  margin-top: 6px; line-height: 1.4;
+}
 
 .job-progress-bar {
   height: 9px;
@@ -980,6 +987,7 @@ section { margin-bottom: 26px; scroll-margin-top: 20px; }
         <div class="tstat"><span class="v" id="stat-rendering">—</span><span class="l">Rendering</span></div>
         <div class="tstat"><span class="v" id="stat-frames-done">—</span><span class="l">Frames done</span></div>
         <div class="tstat"><span class="v" id="stat-speed">—</span><span class="l">Farm speed</span></div>
+        <div class="tstat" id="stat-honey-wrap" style="cursor:pointer" onclick="openHoneyModal()"><span class="v" id="stat-honey">—</span><span class="l">Honey</span></div>
       </div>
       <button class="btn primary" id="btn-new-job" onclick="openSubmitModal()">＋ New Render Job</button>
     </div>
@@ -1156,6 +1164,14 @@ section { margin-bottom: 26px; scroll-margin-top: 20px; }
         </label>
       </div>
 
+      <div class="form-group" id="pack-deps-group">
+        <label class="form-checkbox-wrap">
+          <input type="checkbox" id="pack-deps-check" checked>
+          <span class="form-checkbox-label">Pack dependencies (videos, image sequences, VDB, Alembic…)</span>
+        </label>
+        <div class="form-hint">Collects every external file the .blend references into a self-contained project (blend + assets folder) and ships it to workers — prevents pink/missing textures. <b>If your project uses relative paths (Blender's default), use "Shared Path" mode</b> and enter the .blend's full path on this PC, so the files stored next to it can be found. The job fails if any dependency is missing.</div>
+      </div>
+
       <div class="modal-footer">
         <button class="btn" onclick="closeSubmitModal()">Cancel</button>
         <button class="btn primary" id="submit-job-btn" onclick="submitJob()">Queue Job</button>
@@ -1195,6 +1211,30 @@ section { margin-bottom: 26px; scroll-margin-top: 20px; }
       <div class="modal-footer">
         <button class="btn" onclick="closeSettingsModal()">Cancel</button>
         <button class="btn primary" id="save-settings-btn" onclick="saveSettings()">Save Settings</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ HONEY MODAL ═══════════ -->
+<div class="modal-overlay" id="honey-modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title">🍯 Honey Jar</span>
+      <button class="modal-close" onclick="closeHoneyModal()" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label class="form-label">Balance</label>
+        <div class="info-box" id="honey-balance-display">—</div>
+        <div class="form-hint">
+          Your workers earn 1 🍯 per frame they render for the hive; each
+          finished frame of your own jobs costs 1 🍯. At 0 you can't post new jobs.
+        </div>
+      </div>
+      <div class="form-group" id="honey-loan-section"><!-- filled by JS --></div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeHoneyModal()">Close</button>
       </div>
     </div>
   </div>
@@ -1290,7 +1330,8 @@ function statusClass(status) {
   const map = {
     rendering: 'rendering', idle: 'idle', offline: 'offline',
     queued: 'queued', done: 'done', failed: 'failed', cancelled: 'cancelled',
-    assigned: 'rendering', pending: 'queued', paused: 'paused'
+    assigned: 'rendering', pending: 'queued', paused: 'paused',
+    packing: 'packing'
   };
   return map[status] || 'idle';
 }
@@ -1434,6 +1475,25 @@ function renderHeaderStats(s) {
     ? (fps * 60).toFixed(1) + '<span class="unit">fr/min</span>'
     : '—';
   document.getElementById('stat-node-addr').textContent = s.node_name || s.node_id || '—';
+
+  const honey = s.honey || {};
+  const honeyEl = document.getElementById('stat-honey');
+  if (honey.balance != null) {
+    const loan = honey.loan;
+    const overdue = loan && (s.server_time || Date.now() / 1000) > loan.due_at;
+    honeyEl.textContent = '🍯 ' + honey.balance + (loan ? ' ⚠' : '');
+    honeyEl.style.color = (honey.balance <= 0 || overdue) ? 'var(--bad)' : '';
+    document.getElementById('stat-honey-wrap').title =
+      'Honey — render credits. Your workers earn 1 🍯 per frame they render ' +
+      'for the hive; each finished frame of your own jobs costs 1 🍯. ' +
+      'At 0 you cannot post new jobs until you render for others.\n' +
+      'Lifetime: earned ' + (honey.earned || 0) + ' · spent ' + (honey.spent || 0) +
+      (loan ? '\nLoan: ' + loan.owed + ' 🍯 owed' + (overdue ? ' — OVERDUE!' : '') : '') +
+      '\nClick to open the Honey Jar.';
+  }
+  if (document.getElementById('honey-modal-overlay').classList.contains('open')) {
+    renderHoneyModal();
+  }
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -1642,6 +1702,7 @@ function renderWorkers(s) {
         '<span class="wtag">' + esc(w.os || '—') + '</span>' +
         '<span class="wtag">' + esc(w.blender_version || '—') + '</span>' +
         '<span class="wtag">✓ ' + (w.frames_done ?? 0) + ' frames</span>' +
+        '<span class="wtag" title="Honey this worker earned rendering for this coordinator">🍯 ' + (w.honey_earned ?? 0) + '</span>' +
         '<span class="wtag">⏱ avg ' + fmtTime(w.avg_render_time) + '</span>' +
         (!isOffline
           ? '<button class="btn small" style="margin-left:auto" onclick="pauseWorker(\'' + esc(w.id) + '\', ' + (w.paused ? 'false' : 'true') + ')">' +
@@ -1697,7 +1758,7 @@ function renderJobCard(j) {
   const isExpanded = STATE.expandedJobs.has(j.id);
   const frameRange = `${j.frame_start ?? '?'}–${j.frame_end ?? '?'} /${j.frame_step ?? 1}`;
 
-  const canCancel = ['rendering', 'queued', 'paused'].includes(j.status);
+  const canCancel = ['rendering', 'queued', 'paused', 'packing'].includes(j.status);
   const canDelete = j.status !== 'rendering';
   const canRetry = (j.failed || 0) > 0;
   const canZip = (j.done || 0) > 0;
@@ -1723,7 +1784,11 @@ function renderJobCard(j) {
         ${j.engine ? `<span class="chip engine">${esc(j.engine)}</span>` : ''}
         ${j.device ? `<span class="chip device">${esc(j.device)}</span>` : ''}
         ${j.samples ? `<span class="chip samples">${esc(j.samples)} spp</span>` : ''}
+        ${j.packed ? `<span class="chip packed" title="Project was collected with all external dependencies (videos, sequences, VDB, Alembic)">📦 packed</span>` : ''}
       </div>
+      ${j.status === 'packing' ? `<div class="pack-warn" style="color:var(--dim)">Packing dependencies${j.pack_progress ? ' — ' + esc(j.pack_progress) : ''}… rendering starts when packing finishes.</div>` : ''}
+      ${j.pack_error ? `<div class="pack-warn">⚠ Dependency packing failed: ${esc(j.pack_error)} — the job was stopped so nothing renders pink. "🔄 Retry Failed" re-attempts packing.</div>` : ''}
+      ${(j.pack_missing && j.pack_missing.length) ? `<div class="pack-warn">⚠ Missing dependenc${j.pack_missing.length === 1 ? 'y' : 'ies'}: ${esc(j.pack_missing.slice(0, 5).map(p => p.split(/[\\\/]/).pop()).join(', '))}${j.pack_missing.length > 5 ? ` … and ${j.pack_missing.length - 5} more` : ''}</div>` : ''}
 
       <div class="job-progress-bar">
         <div class="job-progress-seg done" style="width:${donePct}%"></div>
@@ -1818,7 +1883,8 @@ function renderJobDetail(jobId) {
         const done = frames.filter(f => f.status === 'done').sort((a,b) => b.frame - a.frame).slice(0, 8);
         if (!done.length) return '<span style="color:var(--faint);font-size:.75rem;padding:4px">No completed frames yet</span>';
         return done.map(f =>
-          `<a class="recent-frame-thumb" href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image" download>
+          `<a class="recent-frame-thumb" href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image?raw=1" download
+              title="Frame ${f.frame} — click to download the original file">
             <img src="/api/jobs/${esc(jobId)}/frames/${f.frame}/image"
                  alt="Frame ${f.frame}"
                  onerror="this.parentElement.style.display='none'"
@@ -1885,7 +1951,7 @@ function renderFrameTable(jobId, frames) {
     <tbody>
     ${filtered.slice(0, 200).map(f => `<tr>
       <td style="font-weight:600">${f.status === 'done'
-        ? `<a href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image" download style="color:var(--accent);text-decoration:none">${f.frame} ⬇</a>`
+        ? `<a href="/api/jobs/${esc(jobId)}/frames/${f.frame}/image?raw=1" download style="color:var(--accent);text-decoration:none">${f.frame} ⬇</a>`
         : f.frame}</td>
       <td><span class="status-badge ${statusClass(f.status)}" style="font-size:.58rem;padding:2px 8px"><span class="status-dot"></span>${esc(f.status)}</span></td>
       <td>${esc(f.worker || '—')}</td>
@@ -2156,6 +2222,7 @@ async function submitJob() {
 
     fd.append('priority', document.getElementById('priority-select').value || '5');
     fd.append('skip_existing', document.getElementById('skip-existing-check').checked ? '1' : '0');
+    fd.append('pack_deps', document.getElementById('pack-deps-check').checked ? '1' : '0');
 
     const xhr = new XMLHttpRequest();
     const uploadProgress = document.getElementById('upload-progress');
@@ -2198,6 +2265,74 @@ async function submitJob() {
     btn.textContent = 'Queue Job';
     document.getElementById('upload-progress').classList.remove('active');
   }
+}
+
+/* ════════════════════════════════════════════════════════════
+   HONEY MODAL
+   ════════════════════════════════════════════════════════════ */
+function openHoneyModal() {
+  document.getElementById('honey-modal-overlay').classList.add('open');
+  renderHoneyModal();
+}
+
+function closeHoneyModal() {
+  document.getElementById('honey-modal-overlay').classList.remove('open');
+}
+
+function renderHoneyModal() {
+  const s = STATE.status || {};
+  const h = s.honey || {};
+  document.getElementById('honey-balance-display').textContent =
+    `🍯 ${h.balance ?? '—'}  ·  lifetime earned ${h.earned || 0} · spent ${h.spent || 0}`;
+  const sec = document.getElementById('honey-loan-section');
+  if (h.loan) {
+    const now = s.server_time || Date.now() / 1000;
+    const left = h.loan.due_at - now;
+    const overdue = left <= 0;
+    const dueTxt = overdue
+      ? '<span style="color:var(--bad);font-weight:600">OVERDUE — interest doubled to 100%, job posting is frozen until repaid</span>'
+      : 'due in ' + (left >= 86400 ? Math.ceil(left / 86400) + ' day' + (left >= 172800 ? 's' : '')
+                                   : Math.max(1, Math.ceil(left / 3600)) + ' h');
+    sec.innerHTML = `
+      <label class="form-label">Outstanding Loan</label>
+      <div class="info-box">Borrowed ${h.loan.amount} 🍯 — owe <b>${h.loan.owed} 🍯</b>, ${dueTxt}</div>
+      <div class="form-hint">Repaying takes honey from your balance (as much as it can cover).
+        No new loans until this one is fully paid.</div>
+      <button class="btn primary" style="margin-top:8px" onclick="repayLoan()">Repay from balance</button>`;
+  } else {
+    sec.innerHTML = `
+      <label class="form-label" for="honey-loan-input">Need to render right now? Take a loan</label>
+      <input class="form-input" type="number" id="honey-loan-input" min="1" value="100">
+      <div class="form-hint">The hive bank charges 50% interest: borrow N, pay back <b>1.5×N</b>
+        within <b>7 days</b>. Miss the deadline and the interest doubles to 100% (owe <b>2×N</b>)
+        and job posting freezes until you repay. One loan at a time, any size.</div>
+      <button class="btn primary" style="margin-top:8px" onclick="takeLoan()">Take loan</button>`;
+  }
+}
+
+async function honeyAction(url, body) {
+  try {
+    const res = await fetch(API_BASE + url, {
+      method: 'POST', body: JSON.stringify(body),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || ('HTTP ' + res.status));
+    await fetchStatus();
+    renderHoneyModal();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+function takeLoan() {
+  const amt = parseInt(document.getElementById('honey-loan-input').value, 10);
+  if (!amt || amt < 1) { alert('Enter a loan amount.'); return; }
+  honeyAction('/api/honey/loan', { amount: amt });
+}
+
+function repayLoan() {
+  honeyAction('/api/honey/repay', {});
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -2263,7 +2398,7 @@ function connectDashboardSSE() {
   es.onmessage = (e) => {
     try {
       const event = JSON.parse(e.data);
-      if (['frame_done', 'job_submitted', 'job_cancelled', 'job_paused', 'job_resumed'].includes(event.type)) {
+      if (['frame_done', 'job_submitted', 'job_packed', 'job_cancelled', 'job_paused', 'job_resumed'].includes(event.type)) {
         clearTimeout(_debounce);
         _debounce = setTimeout(() => fetchStatus(), 800);
       }

@@ -14,6 +14,7 @@ import os
 import io
 import re
 import json
+import math
 import time
 import uuid
 import glob
@@ -50,6 +51,7 @@ def _resolve_data_dir():
 DATA_DIR      = _resolve_data_dir()
 BLEND_DIR     = DATA_DIR / "blends"
 OUTPUT_DIR    = DATA_DIR / "output"
+PREVIEW_DIR   = DATA_DIR / "previews"
 STATE_FILE    = DATA_DIR / "state.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
@@ -61,6 +63,25 @@ MAX_FRAME_ATTEMPTS = 3
 PREFETCH_THRESHOLD = 75   # % progress that triggers prefetch
 PREFETCH_DEADLINE  = 90   # seconds before stale prefetch is reclaimed
 DEFAULT_PRIORITY   = 5    # job priority 1 (lowest) .. 10 (highest)
+HONEY_START        = 100  # welcome stipend for a fresh node's honey jar
+HONEY_PER_FRAME    = 1    # honey earned (worker) / charged (job owner) per frame
+HONEY_LOAN_INTEREST = 0.5  # borrow N, owe N * 1.5 (no cap on loan size)
+HONEY_LOAN_OVERDUE_INTEREST = 1.0  # miss the deadline: interest rises to 100%
+HONEY_LOAN_DAYS    = 7    # repay deadline; overdue blocks job posting
+PACK_SCRIPT        = BASE_DIR / "pack_deps.py"
+PACK_TIMEOUT       = 1800  # dependency packing can copy many GB
+PREVIEW_SCRIPT     = BASE_DIR / "preview_frame.py"
+PREVIEW_TIMEOUT    = 120   # converting one frame to a JPEG preview
+# Formats browsers can display in an <img> tag; everything else (EXR, TIFF)
+# is converted to a cached JPEG preview before serving to the dashboard
+BROWSER_IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "gif", "bmp"}
+# File types stored uncompressed in the pack zip (already compressed formats)
+PACK_STORED_EXTENSIONS = {
+    ".vdb", ".abc",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg",
+    ".mp3", ".ogg", ".oga", ".flac", ".aac", ".m4a", ".opus",
+    ".jpg", ".jpeg", ".png", ".webp", ".jp2", ".j2k", ".exr", ".dds",
+}
 
 
 def _migrate_legacy_data():
@@ -96,7 +117,7 @@ def _migrate_legacy_data():
 
 
 _migrate_legacy_data()
-for d in (DATA_DIR, BLEND_DIR, OUTPUT_DIR):
+for d in (DATA_DIR, BLEND_DIR, OUTPUT_DIR, PREVIEW_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
@@ -105,6 +126,36 @@ app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024  # 8 GB
 LOCK = threading.Lock()
 JOBS = {}
 WORKERS = {}
+# This node's honey jar (render-credit economy). Each frame a worker of this
+# node renders — for any coordinator on the LAN — earns 1 honey, banked here
+# via /api/honey/earn. Each finished frame of a job posted on THIS coordinator
+# costs 1 honey. An empty jar blocks new job submissions, so contributing
+# render power to the hive is what buys render power from it. Rendering your
+# own job on your own GPU earns back what it costs (net zero), so a solo node
+# never runs dry. A node that really needs to render can take one loan at a
+# time from the hive bank: borrow N, owe 1.5N, due in 7 days — miss the
+# deadline and the interest doubles to 100% (owe 2N) and job posting freezes
+# until the loan is repaid.
+HONEY = {"balance": HONEY_START, "earned": 0, "spent": 0, "loan": None}
+
+
+def _loan_interest(amount, rate):
+    return math.ceil(amount * rate)
+
+
+def _check_loan_overdue():
+    """LOCK must be held. Once the repay deadline passes, the loan's interest
+    rises from 50% to 100% of the borrowed amount — applied exactly once,
+    and computed from the original amount so partial repayments don't shrink
+    the penalty. Returns True when the bump was just applied (caller should
+    save_state once outside the lock)."""
+    loan = HONEY.get("loan")
+    if not loan or loan.get("penalized") or time.time() <= loan["due_at"]:
+        return False
+    loan["penalized"] = True
+    loan["owed"] += (_loan_interest(loan["amount"], HONEY_LOAN_OVERDUE_INTEREST)
+                     - _loan_interest(loan["amount"], HONEY_LOAN_INTEREST))
+    return True
 WORKER_SSE_QUEUES:     dict = {}  # wid -> queue.Queue (connected idle workers)
 DASHBOARD_SSE_CLIENTS: list = []  # list of queue.Queue (connected dashboard tabs)
 
@@ -201,6 +252,166 @@ def probe_blend_file(blend_path):
 
 
 # ---------------------------------------------------------------------------
+# Dependency packing (videos, image sequences, VDB, Alembic, ...)
+# ---------------------------------------------------------------------------
+def pack_blend_job(job_id):
+    """Background worker: run pack_deps.py inside Blender to localize every
+    external file the blend references, zip the resulting project folder and
+    flip the job from 'packing' to 'queued'. Packing was explicitly requested,
+    so on failure the job is FAILED (rendering anyway would silently produce
+    pink frames); the Retry button re-attempts packing."""
+    import zipfile
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job or job["status"] != "packing":
+            return
+        # Shared-path jobs are packed at their ORIGINAL location so the
+        # blend's relative ("//...") asset paths still resolve. Uploaded
+        # blends are packed from the upload copy, which only works for
+        # absolute asset paths.
+        src_path = job.get("shared_path") or job["blend_path"]
+        src_is_shared = bool(job.get("shared_path"))
+        blend_filename = job["blend_filename"]
+        job["pack_progress"] = "collecting files"
+
+    pack_dir = BLEND_DIR / f"{job_id}_pack"
+    zip_path = BLEND_DIR / f"{job_id}_pack.zip"
+    manifest = None
+    error = None
+
+    blender = BLENDER_PATH or detect_blender()
+    if not blender:
+        error = "Blender not found on this machine"
+    elif not src_path or not os.path.exists(src_path):
+        error = f"blend file not found: {src_path}"
+    else:
+        try:
+            shutil.rmtree(pack_dir, ignore_errors=True)
+            pack_dir.mkdir(parents=True, exist_ok=True)
+            # The upload is stored as <job_id>_<name>.blend; pass the original
+            # name so the packed blend is saved as workers expect it
+            cmd = [blender, "-b", "--factory-startup", str(src_path),
+                   "-P", str(PACK_SCRIPT), "--", str(pack_dir), blend_filename]
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=PACK_TIMEOUT,
+                encoding="utf-8", errors="replace")
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            for line in output.splitlines():
+                if line.startswith("RENDERHIVE_PACK:"):
+                    manifest = json.loads(line[len("RENDERHIVE_PACK:"):])
+                    break
+            if manifest is None:
+                # Surface the tail of Blender's output — that's where the
+                # Python traceback ends up when the pack script crashes
+                tail = [l for l in output.strip().splitlines() if l.strip()]
+                for line in tail[-10:]:
+                    print(f"  pack output: {line}")
+                error = "pack script produced no result"
+                if tail:
+                    error += f" (last output: {tail[-1][-300:]})"
+            elif not manifest.get("ok"):
+                error = manifest.get("error", "pack script failed")
+            elif manifest.get("missing"):
+                # The whole point of packing is that every dependency travels.
+                # A file we couldn't find WOULD render pink — fail loudly.
+                miss = manifest["missing"]
+                shown = ", ".join(os.path.basename(m) for m in miss[:5])
+                if len(miss) > 5:
+                    shown += f" … and {len(miss) - 5} more"
+                n_word = (f"{len(miss)} dependenc"
+                          f"{'y' if len(miss) == 1 else 'ies'}")
+                if manifest.get("missing_relative") and not src_is_shared:
+                    # The classic upload failure: relative paths only resolve
+                    # at the blend's original location, not in the upload copy
+                    error = (
+                        f"{n_word} could not be found ({shown}) because this "
+                        ".blend stores RELATIVE paths, which break when only "
+                        "the .blend is uploaded. Submit via 'Shared Path' "
+                        "(the .blend's full path on this PC) — or in Blender "
+                        "run File > External Data > Make All Paths Absolute, "
+                        "save, and re-upload.")
+                else:
+                    error = (
+                        f"{n_word} could not be found: {shown}. Restore the "
+                        "missing files (or relink them in Blender), save, "
+                        "and submit again.")
+            elif not (pack_dir / blend_filename).exists():
+                error = "packed blend file missing from pack folder"
+        except subprocess.TimeoutExpired:
+            error = f"packing timed out after {PACK_TIMEOUT}s"
+        except Exception as e:
+            error = str(e)
+
+    if not error:
+        try:
+            files = [p for p in sorted(pack_dir.rglob("*")) if p.is_file()]
+            total = sum(p.stat().st_size for p in files) or 1
+            done = 0
+            tmp_zip = zip_path.with_suffix(".zip.tmp")
+            with zipfile.ZipFile(tmp_zip, "w") as z:
+                for p in files:
+                    # Already-compressed formats (VDB, video, PNG, EXR, ...)
+                    # gain almost nothing from deflate but make zipping
+                    # minutes slower on multi-GB caches — store those as-is
+                    if p.suffix.lower() in PACK_STORED_EXTENSIONS:
+                        z.write(p, p.relative_to(pack_dir).as_posix(),
+                                compress_type=zipfile.ZIP_STORED)
+                    else:
+                        z.write(p, p.relative_to(pack_dir).as_posix(),
+                                compress_type=zipfile.ZIP_DEFLATED,
+                                compresslevel=1)
+                    done += p.stat().st_size
+                    with LOCK:
+                        j2 = JOBS.get(job_id)
+                        if j2 and j2["status"] == "packing":
+                            j2["pack_progress"] = \
+                                f"zipping {int(done * 100 / total)}%"
+            os.replace(tmp_zip, zip_path)
+        except Exception as e:
+            error = f"could not zip packed project: {e}"
+    shutil.rmtree(pack_dir, ignore_errors=True)
+
+    with LOCK:
+        job = JOBS.get(job_id)
+        if not job or job["status"] != "packing":
+            # Deleted or cancelled while packing — discard the work
+            try:
+                zip_path.unlink()
+            except OSError:
+                pass
+            return
+        job.pop("pack_progress", None)
+        if error:
+            job["pack_error"] = error
+            if manifest and manifest.get("missing"):
+                job["pack_missing"] = manifest["missing"]
+            job["status"] = "failed"
+            for fr in job["frames"].values():
+                if fr["status"] == "pending":
+                    fr["status"] = "failed"
+                    fr["last_error"] = f"dependency packing failed: {error}"
+            print(f"  [PACK] job {job_id}: packing failed — {error}")
+            _broadcast_dashboard({"type": "job_packed", "job_id": job_id})
+        else:
+            job["packed_zip"] = str(zip_path)
+            if manifest.get("missing"):
+                job["pack_missing"] = manifest["missing"]
+                print(f"  [PACK] job {job_id}: {len(manifest['missing'])} "
+                      "dependencies were not found on disk")
+            mb = manifest.get("bytes", 0) / 1048576
+            print(f"  [PACK] job {job_id}: {manifest.get('copied', 0)} files "
+                  f"collected, project is {mb:.1f} MB")
+            job["status"] = "queued"
+            _recompute_job_statuses()
+            for _wid in list(WORKER_SSE_QUEUES.keys()):
+                _push_worker_event(_wid, {"type": "work_available"})
+            _broadcast_dashboard({"type": "job_packed", "job_id": job_id})
+    save_state()
+    if not error and DISCOVERY:
+        DISCOVERY.broadcast_wake()
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 def save_state():
@@ -208,7 +419,7 @@ def save_state():
     try:
         tmp = STATE_FILE.with_suffix(".json.tmp")
         with open(tmp, "w") as f:
-            json.dump({"jobs": JOBS}, f)
+            json.dump({"jobs": JOBS, "honey": HONEY}, f)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
         print("warn: could not save state:", e)
@@ -219,6 +430,15 @@ def load_state():
         try:
             data = json.load(open(STATE_FILE))
             JOBS.update(data.get("jobs", {}))
+            honey = data.get("honey", {})
+            for k in HONEY:
+                if isinstance(honey.get(k), (int, float)):
+                    HONEY[k] = honey[k]
+            loan = honey.get("loan")
+            if isinstance(loan, dict) and all(
+                    isinstance(loan.get(k), (int, float))
+                    for k in ("amount", "owed", "taken_at", "due_at")):
+                HONEY["loan"] = loan
             for job in JOBS.values():
                 job.setdefault("priority", DEFAULT_PRIORITY)
                 for fr in job["frames"].values():
@@ -261,6 +481,46 @@ EXT_FOR_FORMAT = {
     "OPEN_EXR_MULTILAYER": "exr", "TIFF": "tif", "WEBP": "webp",
 }
 
+# Serialize preview conversions: each one launches a headless Blender, and a
+# burst of thumbnail requests must not spawn a Blender per frame
+PREVIEW_LOCK = threading.Lock()
+
+
+def ensure_preview(job, frame_num):
+    """Return the path of a browser-viewable JPEG preview for a finished
+    EXR/TIFF frame, converting (via headless Blender) and caching it the
+    first time. Returns None when the frame file is gone or conversion
+    fails — the dashboard then simply hides that thumbnail."""
+    out_file = Path(job["output_dir"]) / f"{job['name']}_{frame_num:04d}.{job['ext']}"
+    if not out_file.exists():
+        return None
+    prev_file = PREVIEW_DIR / job["id"] / f"{frame_num:04d}.jpg"
+    with PREVIEW_LOCK:
+        # mtime check so a re-rendered (retried) frame gets a fresh preview
+        if prev_file.exists() and prev_file.stat().st_mtime >= out_file.stat().st_mtime:
+            return prev_file
+        blender = BLENDER_PATH or detect_blender()
+        if not blender:
+            print(f"  preview failed for {out_file.name}: Blender not found")
+            return None
+        prev_file.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [blender, "-b", "--factory-startup",
+               "-P", str(PREVIEW_SCRIPT), "--", str(out_file), str(prev_file)]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=PREVIEW_TIMEOUT,
+                encoding="utf-8", errors="replace")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"  preview failed for {out_file.name}: {e}")
+            return None
+        if not prev_file.exists():
+            output = (result.stdout or "") + "\n" + (result.stderr or "")
+            tail = [l for l in output.strip().splitlines() if l.strip()]
+            detail = tail[-1][-200:] if tail else "no output"
+            print(f"  preview failed for {out_file.name}: {detail}")
+            return None
+        return prev_file
+
 
 def _worker_avg_speed(w):
     """Mean of last 10 render times, or None if no history."""
@@ -299,7 +559,7 @@ def _notify_idle_workers_sse(exclude_wid=None):
 def _scheduler_jobs():
     """Jobs in dispatch order: priority (high first), then submit time (FIFO).
     Excludes jobs that can't accept work. Call inside LOCK."""
-    skip = ("cancelled", "done", "paused")
+    skip = ("cancelled", "done", "paused", "packing")
     return [j for j in sorted(JOBS.values(),
                               key=lambda j: (-j.get("priority", DEFAULT_PRIORITY),
                                              j["created_at"]))
@@ -331,6 +591,7 @@ def _assignment_payload(job, fno):
         "blend_url": f"/api/jobs/{job['id']}/blend",
         "engine": job["engine"], "device": job["device"],
         "samples": job["samples"], "format": job["format"],
+        "packed": bool(job.get("packed_zip")),
     }
 
 
@@ -467,6 +728,10 @@ def job_summary(job):
         "created_at": job["created_at"],
         "shared_path": job.get("shared_path"),
         "output_dir": job.get("output_dir"),
+        "packed": bool(job.get("packed_zip")),
+        "pack_error": job.get("pack_error"),
+        "pack_missing": job.get("pack_missing"),
+        "pack_progress": job.get("pack_progress"),
     }
 
 
@@ -578,7 +843,7 @@ def _reap_once(now=None):
 
 def _recompute_job_statuses():
     for job in JOBS.values():
-        if job["status"] in ("cancelled", "paused"):
+        if job["status"] in ("cancelled", "paused", "packing"):
             continue
         statuses = [f["status"] for f in job["frames"].values()]
         if all(s in ("done", "failed") for s in statuses):
@@ -634,6 +899,7 @@ def api_status():
                 "current_frame": w["current_frame"],
                 "progress": w["progress"],
                 "frames_done": w["frames_done"],
+                "honey_earned": w.get("honey_earned", 0),
                 "last_seen_ago": round(now - w["last_seen"]),
                 "avg_render_time": avg_rt,
                 "total_render_time": total_rt,
@@ -646,6 +912,8 @@ def api_status():
                 hostname_stats[h]["workers_online"] += 1
             if w.get("current_job") and not offline:
                 hostname_stats[h]["jobs_active"].add(w["current_job"])
+        loan_penalized = _check_loan_overdue()
+        honey = dict(HONEY)
         jobs = [job_summary(j) for j in
                 sorted(JOBS.values(), key=lambda x: x["created_at"], reverse=True)]
         # Queue-aware ETA: jobs are dispatched in priority/FIFO order, so a
@@ -683,6 +951,9 @@ def api_status():
                 "jobs_active": len(pstats.get("jobs_active", set())),
             })
 
+    if loan_penalized:
+        save_state()
+
     node_id = DISCOVERY.node_id if DISCOVERY else "local"
     node_name = DISCOVERY.node_name if DISCOVERY else socket.gethostname()
 
@@ -690,6 +961,7 @@ def api_status():
         "node_id": node_id,
         "node_name": node_name,
         "server_time": now,
+        "honey": honey,
         "peers": peers,
         "workers": workers,
         "jobs": jobs,
@@ -745,6 +1017,26 @@ def api_job_detail(job_id):
 # ---------------------------------------------------------------------------
 @app.route("/api/jobs", methods=["POST"])
 def api_submit_job():
+    with LOCK:
+        penalized = _check_loan_overdue()
+        out_of_honey = HONEY["balance"] <= 0
+        loan = HONEY.get("loan")
+        loan_overdue = bool(loan and time.time() > loan["due_at"])
+        loan_owed = loan["owed"] if loan else 0
+    if penalized:
+        save_state()
+    if loan_overdue:
+        return jsonify({"error": f"Your honey loan is overdue ({loan_owed} "
+                        "honey owed — interest rose to 100%)! The hive bank "
+                        "has frozen your jar — repay the loan before posting "
+                        "new render jobs."}), 402
+    if out_of_honey:
+        return jsonify({"error": "Out of honey! Each rendered frame of your "
+                        "jobs costs 1 honey and your jar is empty. Leave "
+                        "RenderHive running so your GPUs render frames for "
+                        "the hive — every frame they finish earns 1 honey. "
+                        "Really stuck? Take a honey loan from the 🍯 panel "
+                        "on the dashboard."}), 402
     job_id = uuid.uuid4().hex[:8]
     form = request.form
 
@@ -757,6 +1049,7 @@ def api_submit_job():
     samples = (form.get("samples") or "").strip()
     out_format = (form.get("format") or "").strip()
     skip_existing = form.get("skip_existing") in ("1", "true", "on")
+    pack_deps = form.get("pack_deps") in ("1", "true", "on")
     shared_path = (form.get("shared_path") or "").strip()
     output_dir_override = (form.get("output_dir") or "").strip()
     try:
@@ -832,6 +1125,12 @@ def api_submit_job():
             frames[str(fno)] = {"status": "pending", "worker": None,
                                 "render_time": None, "attempts": 0, "progress": 0}
 
+    # Packing works for both sources. Shared-path is actually the better one:
+    # the blend is opened at its original location, so relative asset paths
+    # ("//textures/x.mp4") resolve. After packing, the project is fully
+    # self-contained — workers no longer need to reach the shared path.
+    do_pack = pack_deps and (blend_path is not None or bool(shared_path))
+
     job = {
         "id": job_id, "name": name,
         "blend_filename": blend_filename, "blend_path": blend_path,
@@ -842,19 +1141,24 @@ def api_submit_job():
         "format": out_format, "ext": ext,
         "output_dir": str(job_out),
         "priority": priority,
-        "status": "queued", "created_at": time.time(),
+        "status": "packing" if do_pack else "queued",
+        "created_at": time.time(),
         "frames": frames,
     }
     with LOCK:
         JOBS[job_id] = job
         _recompute_job_statuses()
-        for _wid in list(WORKER_SSE_QUEUES.keys()):
-            _push_worker_event(_wid, {"type": "work_available"})
+        if not do_pack:
+            for _wid in list(WORKER_SSE_QUEUES.keys()):
+                _push_worker_event(_wid, {"type": "work_available"})
         _broadcast_dashboard({"type": "job_submitted", "job_id": job_id})
     save_state()
 
+    if do_pack:
+        threading.Thread(target=pack_blend_job, args=(job_id,),
+                         daemon=True, name=f"pack-{job_id}").start()
     # Wake all workers so they immediately poll (for non-SSE workers too)
-    if DISCOVERY:
+    elif DISCOVERY:
         DISCOVERY.broadcast_wake()
 
     return jsonify({"ok": True, "job_id": job_id, "frames": len(frames),
@@ -924,11 +1228,15 @@ def api_delete(job_id):
     delete_outputs = bool(d.get("delete_outputs"))
     with LOCK:
         job = JOBS.pop(job_id, None)
-    if job and job.get("blend_path") and os.path.exists(job["blend_path"]):
-        try:
-            os.remove(job["blend_path"])
-        except OSError:
-            pass
+    if job:
+        for key in ("blend_path", "packed_zip"):
+            p = job.get(key)
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        shutil.rmtree(PREVIEW_DIR / job_id, ignore_errors=True)
     if job and delete_outputs and job.get("output_dir"):
         # Only delete output folders we manage — never a user-chosen custom path
         out = Path(job["output_dir"]).resolve()
@@ -943,7 +1251,9 @@ def api_delete(job_id):
 
 @app.route("/api/jobs/<job_id>/retry", methods=["POST"])
 def api_retry(job_id):
-    """Retry all failed frames in a job."""
+    """Retry all failed frames in a job. A job that failed because dependency
+    packing failed re-attempts the packing first."""
+    repack = False
     with LOCK:
         job = JOBS.get(job_id)
         if not job:
@@ -957,11 +1267,19 @@ def api_retry(job_id):
                 fr["attempts"] = 0
                 fr["last_error"] = None
                 retried += 1
+        if job.get("pack_error") and (job.get("blend_path")
+                                      or job.get("shared_path")):
+            job.pop("pack_error", None)
+            job["status"] = "packing"
+            repack = True
         _recompute_job_statuses()
     save_state()
-    if DISCOVERY:
+    if repack:
+        threading.Thread(target=pack_blend_job, args=(job_id,),
+                         daemon=True, name=f"pack-{job_id}").start()
+    elif DISCOVERY:
         DISCOVERY.broadcast_wake()
-    return jsonify({"ok": True, "retried": retried})
+    return jsonify({"ok": True, "retried": retried, "repacking": repack})
 
 
 @app.route("/api/jobs/<job_id>/pause", methods=["POST"])
@@ -1039,7 +1357,13 @@ def api_requeue_frame(job_id, frame_num):
 def api_get_blend(job_id):
     with LOCK:
         job = JOBS.get(job_id)
-    if not job or not job.get("blend_path"):
+    if not job:
+        abort(404)
+    # Packed jobs ship a zip of the whole project (blend + deps folder)
+    if job.get("packed_zip") and os.path.exists(job["packed_zip"]):
+        return send_file(job["packed_zip"], as_attachment=True,
+                         download_name=f"{job_id}_pack.zip")
+    if not job.get("blend_path"):
         abort(404)
     return send_file(job["blend_path"], as_attachment=True,
                      download_name=job["blend_filename"])
@@ -1242,22 +1566,36 @@ def api_complete(wid):
         out_file = out_dir / f"{job['name']}_{frame:04d}.{job['ext']}"
         if "image" in request.files:
             request.files["image"].save(str(out_file))
+            if job["ext"].lower() not in BROWSER_IMAGE_EXTS:
+                # Convert EXR/TIFF to a JPEG preview now (in the background)
+                # so the dashboard thumbnail is instant when first viewed
+                threading.Thread(target=ensure_preview, args=(job, frame),
+                                 daemon=True,
+                                 name=f"preview-{job_id}-{frame}").start()
 
     with LOCK:
         fr = job["frames"].get(str(frame))
-        if fr and not is_cancelled:
+        paid = bool(fr and not is_cancelled)
+        if paid:
             fr["status"] = "done"
             fr["render_time"] = render_time
             fr["worker"] = wid
             fr["progress"] = 100
             fr["finished_at"] = time.time()
             fr.pop("prefetch_deadline", None)
+            # The job owner (this node) pays for the render; the response
+            # tells the worker how much honey it earned so it can bank it
+            # with its own coordinator
+            HONEY["balance"] -= HONEY_PER_FRAME
+            HONEY["spent"]   += HONEY_PER_FRAME
         if w:
             w["status"] = "idle"
             w["current_job"] = None
             w["current_frame"] = None
             w["progress"] = 0
             w["last_seen"] = time.time()
+            if paid:
+                w["honey_earned"] = w.get("honey_earned", 0) + HONEY_PER_FRAME
             if not is_cancelled:
                 w["frames_done"] = w.get("frames_done", 0) + 1
                 if "render_times" not in w:
@@ -1274,7 +1612,7 @@ def api_complete(wid):
         if not is_cancelled:
             _broadcast_dashboard({"type": "frame_done", "job_id": job_id, "frame": frame})
     save_state()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "honey": HONEY_PER_FRAME if paid else 0})
 
 
 @app.route("/api/workers/<wid>/fail", methods=["POST"])
@@ -1306,6 +1644,97 @@ def api_fail(wid):
     save_state()
     print(f"[FAIL] worker={wid} job={job_id} frame={frame}\n{log[-500:]}")
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Honey (render-credit economy)
+# ---------------------------------------------------------------------------
+@app.route("/api/honey")
+def api_honey():
+    with LOCK:
+        penalized = _check_loan_overdue()
+        result = dict(HONEY)
+    if penalized:
+        save_state()
+    return jsonify(result)
+
+
+@app.route("/api/honey/earn", methods=["POST"])
+def api_honey_earn():
+    """Bank honey a worker of this node earned by rendering a frame for any
+    coordinator on the LAN. Workers call their home coordinator after every
+    finished frame."""
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        amount = int(d.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0
+    if not 0 < amount <= 100:
+        return jsonify({"error": "invalid amount"}), 400
+    with LOCK:
+        HONEY["balance"] += amount
+        HONEY["earned"]  += amount
+        balance = HONEY["balance"]
+    save_state()
+    return jsonify({"ok": True, "balance": balance})
+
+
+@app.route("/api/honey/loan", methods=["POST"])
+def api_honey_loan():
+    """Take a loan from the hive bank: borrow N now (any size), owe N * 1.5,
+    due in HONEY_LOAN_DAYS. Missing the deadline raises the interest to 100%
+    and freezes job posting until the loan is repaid. One loan at a time."""
+    d = request.get_json(force=True, silent=True) or {}
+    try:
+        amount = int(d.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0
+    if amount <= 0:
+        return jsonify({"error": "loan must be a positive amount of honey"}), 400
+    with LOCK:
+        if HONEY.get("loan"):
+            return jsonify({"error": "You already have an outstanding loan — "
+                            "repay it before taking another."}), 400
+        now = time.time()
+        HONEY["loan"] = {
+            "amount": amount,
+            "owed": amount + _loan_interest(amount, HONEY_LOAN_INTEREST),
+            "taken_at": now,
+            "due_at": now + HONEY_LOAN_DAYS * 86400,
+            "penalized": False,
+        }
+        HONEY["balance"] += amount
+        result = dict(HONEY)
+    save_state()
+    return jsonify({"ok": True, **result})
+
+
+@app.route("/api/honey/repay", methods=["POST"])
+def api_honey_repay():
+    """Pay down the outstanding loan from the jar balance. With no explicit
+    amount, pays as much as the balance covers; the loan clears at 0 owed."""
+    d = request.get_json(force=True, silent=True) or {}
+    with LOCK:
+        _check_loan_overdue()  # settle at the penalized rate, not the old owed
+        loan = HONEY.get("loan")
+        if not loan:
+            return jsonify({"error": "no outstanding loan"}), 400
+        try:
+            amount = int(d.get("amount",
+                                min(HONEY["balance"], loan["owed"])))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid amount"}), 400
+        amount = min(amount, loan["owed"], HONEY["balance"])
+        if amount <= 0:
+            return jsonify({"error": "no honey available to repay with — "
+                            "render some frames for the hive first"}), 400
+        HONEY["balance"] -= amount
+        loan["owed"] -= amount
+        if loan["owed"] <= 0:
+            HONEY["loan"] = None
+        result = dict(HONEY)
+    save_state()
+    return jsonify({"ok": True, "repaid": amount, **result})
 
 
 # ---------------------------------------------------------------------------
@@ -1394,7 +1823,11 @@ def api_dashboard_events():
 
 @app.route("/api/jobs/<job_id>/frames/<int:frame_num>/image")
 def api_frame_image(job_id, frame_num):
-    """Serve a single completed frame image directly (no ZIP required)."""
+    """Serve a single completed frame image directly (no ZIP required).
+
+    Browsers cannot decode EXR/TIFF, so for those formats the dashboard
+    preview is a cached JPEG conversion; pass ?raw=1 to download the
+    original frame file instead."""
     with LOCK:
         job = JOBS.get(job_id)
     if not job:
@@ -1402,7 +1835,13 @@ def api_frame_image(job_id, frame_num):
     out_file = Path(job["output_dir"]) / f"{job['name']}_{frame_num:04d}.{job['ext']}"
     if not out_file.exists():
         abort(404)
-    return send_file(str(out_file))
+    raw = request.args.get("raw") in ("1", "true")
+    if raw or job["ext"].lower() in BROWSER_IMAGE_EXTS:
+        return send_file(str(out_file), as_attachment=raw)
+    prev_file = ensure_preview(job, frame_num)
+    if not prev_file:
+        abort(404)  # dashboard hides thumbnails that 404
+    return send_file(str(prev_file), mimetype="image/jpeg")
 
 
 # ---------------------------------------------------------------------------
@@ -1414,6 +1853,12 @@ def create_app(discovery=None, blender_path=None):
     DISCOVERY = discovery
     BLENDER_PATH = blender_path or detect_blender()
     load_state()
+    # Restart dependency packing for jobs interrupted by a shutdown
+    with LOCK:
+        stuck = [j["id"] for j in JOBS.values() if j["status"] == "packing"]
+    for job_id in stuck:
+        threading.Thread(target=pack_blend_job, args=(job_id,),
+                         daemon=True, name=f"pack-{job_id}").start()
     threading.Thread(target=reap_dead_workers_and_frames, daemon=True).start()
     return app
 

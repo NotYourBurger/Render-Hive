@@ -149,7 +149,7 @@ def get_gpu_indices(args):
 
 
 def start_worker_thread(gpu_index, device, blender, shared_root,
-                        discovery, name_prefix=None):
+                        discovery, name_prefix=None, home_server=None):
     """Start a worker in a daemon thread."""
     name = f"{name_prefix or socket.gethostname()}-gpu{gpu_index}"
     w = Worker(
@@ -160,6 +160,7 @@ def start_worker_thread(gpu_index, device, blender, shared_root,
         name=name,
         discovery=discovery,
         server=None,  # use discovery
+        home_server=home_server,  # honey earned anywhere is banked here
     )
     t = threading.Thread(target=w.run, daemon=True,
                          name=f"worker-gpu{gpu_index}")
@@ -255,6 +256,7 @@ def main():
                     shared_root=args.shared_root,
                     discovery=discovery,
                     name_prefix=node_name,
+                    home_server=f"http://127.0.0.1:{args.port}",
                 )
                 worker_threads.append(t)
                 print(f"  [✓] Worker GPU {gi} started")
