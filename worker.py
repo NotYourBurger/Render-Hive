@@ -29,6 +29,20 @@ import requests
 
 POLL_IDLE = 3.0
 
+
+def _fs_retry(fn, attempts=6, delay=0.5):
+    """Run a filesystem operation, retrying on transient Windows errors.
+    Antivirus scanners (and the search indexer) briefly hold freshly
+    written files open, making rename/unlink fail with a sharing
+    violation (WinError 32) even though nothing is wrong."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except OSError:
+            if i == attempts - 1:
+                raise
+            time.sleep(delay * (i + 1))
+
 # The script fed to Blender to configure output + GPU per frame
 GPU_SETUP_SCRIPT = r'''
 import bpy, os
@@ -177,6 +191,7 @@ class Worker:
         self.os_info = f"{platform.system()} {platform.release()}"
         self.cache = Path(tempfile.gettempdir()) / "renderhive_cache" / self.id
         self.cache.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_partials()
         self.setup_script = self.cache / "gpu_setup.py"
         self.setup_script.write_text(GPU_SETUP_SCRIPT)
         self.bversion = blender_version(blender)
@@ -184,6 +199,22 @@ class Worker:
         self._wake_event = threading.Event()
         self._prefetch_queue: list = []         # list of (coord_url, assignment) tuples
         self._sse_event_queue = _queue.Queue()  # events pushed from coordinator SSE stream
+
+    def _cleanup_stale_partials(self):
+        """Remove .part leftovers from crashed/killed runs. Age-gated so we
+        never touch an in-progress download by another process that shares
+        this cache (the same worker id launched twice)."""
+        cutoff = time.time() - 6 * 3600
+        for stale in self.cache.glob("*.part"):
+            try:
+                if stale.stat().st_mtime >= cutoff:
+                    continue
+                if stale.is_dir():
+                    shutil.rmtree(stale, ignore_errors=True)
+                else:
+                    stale.unlink()
+            except OSError:
+                pass
 
     def _worker_info(self):
         """Worker info dict sent with registration and /next requests."""
@@ -340,14 +371,17 @@ class Worker:
         local = self.cache / f"{assign['job_id']}_{assign['blend_filename']}"
         if not local.exists():
             print(f"  downloading {assign['blend_filename']} ...")
+            # pid suffix: two workers sharing this cache (same id launched
+            # twice) must not write the same temp file
+            tmp = local.with_suffix(local.suffix + f".{os.getpid()}.part")
             with requests.get(coord_url + assign["blend_url"],
                               stream=True, timeout=600) as r:
                 r.raise_for_status()
-                tmp = local.with_suffix(local.suffix + ".part")
                 with open(tmp, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1 << 20):
                         f.write(chunk)
-                tmp.rename(local)
+            # os.replace overwrites if a concurrent download finished first
+            _fs_retry(lambda: os.replace(tmp, local))
         return str(local)
 
     def resolve_packed_blend(self, coord_url, assign):
@@ -372,7 +406,10 @@ class Worker:
                                      assign["frame"], 0)
                 last_ping[0] = time.time()
 
-        ztmp = self.cache / f"{assign['job_id']}_pack.zip.part"
+        # pid suffix: two workers sharing this cache (same id launched
+        # twice) must not write the same temp file — that surfaced as
+        # WinError 32 "file in use by another process" on the .part
+        ztmp = self.cache / f"{assign['job_id']}_pack.zip.{os.getpid()}.part"
         got = 0
         with requests.get(coord_url + assign["blend_url"],
                           stream=True, timeout=600) as r:
@@ -385,15 +422,27 @@ class Worker:
         print(f"  downloaded {got / 1048576:.0f} MB — extracting ...")
         # Extract to a temp dir and rename, so a crash mid-extract can't
         # leave a half-complete project that looks usable
-        tmpdir = jobdir.with_name(jobdir.name + ".part")
+        tmpdir = jobdir.with_name(f"{jobdir.name}.{os.getpid()}.part")
         shutil.rmtree(tmpdir, ignore_errors=True)
         with zipfile.ZipFile(ztmp) as z:
             for member in z.infolist():
                 z.extract(member, tmpdir)
                 ping()
-        ztmp.unlink()
+        try:
+            _fs_retry(ztmp.unlink)
+        except OSError:
+            pass  # extraction succeeded; leftover is removed on next start
+        if blend_local.exists():
+            # a concurrent worker finished extracting the same pack first
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            return str(blend_local)
         shutil.rmtree(jobdir, ignore_errors=True)
-        tmpdir.rename(jobdir)
+        try:
+            _fs_retry(lambda: tmpdir.rename(jobdir))
+        except OSError:
+            if not blend_local.exists():
+                raise
+            shutil.rmtree(tmpdir, ignore_errors=True)
         if not blend_local.exists():
             raise RuntimeError(
                 f"packed project did not contain {assign['blend_filename']}")
